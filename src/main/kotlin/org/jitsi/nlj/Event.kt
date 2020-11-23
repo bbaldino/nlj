@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,25 +15,14 @@
  */
 package org.jitsi.nlj
 
-import org.jitsi.impl.neomedia.rtp.RTPEncodingDesc
-import org.jitsi.service.neomedia.RTPExtension
-import org.jitsi.service.neomedia.format.MediaFormat
+import org.jitsi.utils.MediaType
 
 interface Event
 
-class RtpPayloadTypeAddedEvent(val payloadType: Byte, val format: MediaFormat) : Event
-class RtpPayloadTypeClearEvent : Event
+class SetMediaSourcesEvent(val mediaSourceDescs: Array<MediaSourceDesc>) : Event
 
-class RtpExtensionAddedEvent(val extensionId: Byte, val rtpExtension: RTPExtension) : Event
-class RtpExtensionClearEvent : Event
+class SetLocalSsrcEvent(val mediaType: MediaType, val ssrc: Long) : Event
 
-class ReceiveSsrcAddedEvent(val ssrc: Long) : Event
-class ReceiveSsrcRemovedEvent(val ssrc: Long) : Event
+class BandwidthEstimationChangedEvent(val bandwidthBps: Long) : Event
 
-class SsrcAssociationEvent(
-    val primarySsrc: Long,
-    val secondarySsrc: Long,
-    val type: String
-) : Event
-
-class RtpEncodingsEvent(val rtpEncodings: List<RTPEncodingDesc>) : Event
+class FeatureToggleEvent(val feature: Features, val enable: Boolean) : Event

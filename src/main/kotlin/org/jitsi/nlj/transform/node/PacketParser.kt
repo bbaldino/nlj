@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,26 @@ package org.jitsi.nlj.transform.node
 
 import org.jitsi.nlj.PacketInfo
 import org.jitsi.rtp.Packet
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.logging2.createChildLogger
 
-class PacketParser(name: String, private val action: (Packet) -> Packet) : Node(name) {
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        p.forEach {
-            it.packet = action(it.packet)
+open class PacketParser(
+    name: String,
+    parentLogger: Logger,
+    private val action: (Packet) -> Packet
+) : TransformerNode(name) {
+    private val logger = createChildLogger(parentLogger)
+
+    override fun transform(packetInfo: PacketInfo): PacketInfo? {
+        return try {
+            packetInfo.packet = action(packetInfo.packet)
+            packetInfo.resetPayloadVerification()
+            packetInfo
+        } catch (e: Exception) {
+            logger.warn("Error parsing packet: $e")
+            null
         }
-        next(p)
     }
+
+    override fun trace(f: () -> Unit) = f.invoke()
 }

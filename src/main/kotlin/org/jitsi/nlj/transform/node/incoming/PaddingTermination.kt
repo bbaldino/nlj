@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,35 +15,51 @@
  */
 package org.jitsi.nlj.transform.node.incoming
 
-import org.jitsi.impl.neomedia.transform.PaddingTermination
 import org.jitsi.nlj.PacketInfo
 import org.jitsi.nlj.stats.NodeStatsBlock
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.util.toRawPacket
+import org.jitsi.nlj.transform.node.TransformerNode
+import org.jitsi.rtp.rtp.RtpPacket
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.logging2.createChildLogger
+import kotlin.math.max
 
-class PaddingTermination : Node("Padding termination") {
-    private val paddingTermination = PaddingTermination()
-    private var numPaddingPacketsSeen = 0
+/**
+ * A node which removes padding from RTP packets.
+ * Padding-only packets are marked as shouldDiscard in their PacketInfo.
+ */
+class PaddingTermination(parentLogger: Logger) : TransformerNode("Padding termination") {
+    private val logger = createChildLogger(parentLogger)
+    private var numPaddedPacketsSeen = 0
+    private var numPaddingOnlyPacketsSeen = 0
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        val outPackets = mutableListOf<PacketInfo>()
-        p.forEach { packetInfo ->
-            paddingTermination.reverseTransform(packetInfo.packet.toRawPacket())?.let {
-                // If paddingTermination didn't return null, that means this is a packet
-                // that should be forwarded.
-                outPackets.add(packetInfo)
-            } ?: run {
-                numPaddingPacketsSeen++
+    override fun transform(packetInfo: PacketInfo): PacketInfo? {
+        val rtpPacket = packetInfo.packetAs<RtpPacket>()
+
+        if (rtpPacket.hasPadding) {
+            rtpPacket.removePadding()
+            packetInfo.resetPayloadVerification()
+            numPaddedPacketsSeen++
+            if (rtpPacket.payloadLength == 0) {
+                numPaddingOnlyPacketsSeen++
+                packetInfo.shouldDiscard = true
             }
         }
-        next(outPackets)
+
+        return packetInfo
     }
 
     override fun getNodeStats(): NodeStatsBlock {
-        val parentStats = super.getNodeStats()
-        return NodeStatsBlock(name).apply {
-            addAll(parentStats)
-            addStat("num padding packets seen: $numPaddingPacketsSeen")
+        return super.getNodeStats().apply {
+            addNumber("num_padded_packets_seen", numPaddedPacketsSeen)
+            addNumber("num_padding_only_packets_seen", numPaddingOnlyPacketsSeen)
         }
     }
+
+    override fun trace(f: () -> Unit) = f.invoke()
+}
+
+fun RtpPacket.removePadding() {
+    val paddingSize = paddingSize
+    length = max(length - paddingSize, headerLength)
+    hasPadding = false
 }

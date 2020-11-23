@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,51 +15,249 @@
  */
 package org.jitsi.nlj.dtls
 
+import java.math.BigInteger
+import java.security.KeyPair
+import java.security.KeyPairGenerator
+import java.security.SecureRandom
+import java.security.Security
+import java.time.Duration
+import java.util.Date
+import java.util.NoSuchElementException
 import org.bouncycastle.asn1.ASN1Encoding
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.asn1.x500.X500NameBuilder
 import org.bouncycastle.asn1.x500.style.BCStyle
-import org.bouncycastle.cert.X509v3CertificateBuilder
-import org.bouncycastle.crypto.AsymmetricCipherKeyPair
-import org.bouncycastle.crypto.generators.RSAKeyPairGenerator
-import org.bouncycastle.crypto.params.RSAKeyGenerationParameters
-import org.bouncycastle.crypto.util.SubjectPublicKeyInfoFactory
+import org.bouncycastle.asn1.x509.Certificate
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+import org.bouncycastle.jce.ECNamedCurveTable
+import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.DefaultDigestAlgorithmIdentifierFinder
-import org.bouncycastle.operator.DefaultSignatureAlgorithmIdentifierFinder
 import org.bouncycastle.operator.bc.BcDefaultDigestProvider
-import org.bouncycastle.operator.bc.BcRSAContentSignerBuilder
-import java.math.BigInteger
-import java.security.SecureRandom
-import java.time.Duration
-import java.util.*
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+import org.bouncycastle.tls.AlertDescription
+import org.bouncycastle.tls.TlsContext
+import org.bouncycastle.tls.TlsUtils
+import org.bouncycastle.tls.crypto.TlsSecret
+import org.bouncycastle.tls.crypto.impl.bc.BcTlsCertificate
+import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.logging2.cdebug
+import org.jitsi.utils.logging2.cerror
+import org.jitsi.utils.logging2.cinfo
 
+val SECURE_RANDOM = SecureRandom()
+val BC_TLS_CRYPTO = BcTlsCrypto(SECURE_RANDOM)
+
+/**
+ * Various helper utilities for DTLS
+ *
+ * https://tools.ietf.org/html/draft-ietf-rtcweb-security-arch-18
+ */
 class DtlsUtils {
     companion object {
+        init {
+            Security.addProvider(BouncyCastleProvider())
+        }
+
+        fun generateCertificateInfo(): CertificateInfo {
+            val cn = generateCN("TODO-APP-NAME", "TODO-APP-VERSION")
+            val keyPair = generateEcKeyPair()
+            val x509certificate = generateCertificate(cn, keyPair)
+            val localFingerprintHashFunction = x509certificate.getHashFunction()
+            val localFingerprint = x509certificate.getFingerprint(localFingerprintHashFunction)
+
+            val certificate = org.bouncycastle.tls.Certificate(
+                arrayOf(BcTlsCertificate(BC_TLS_CRYPTO, x509certificate))
+            )
+            return CertificateInfo(
+                keyPair,
+                certificate,
+                localFingerprintHashFunction,
+                localFingerprint,
+                System.currentTimeMillis()
+            )
+        }
+
         /**
-         * Finds the first value that appears in both [ours] and [theirs]
+         * A helper which finds an SRTP protection profile present in both
+         * [ours] and [theirs].  Throws [DtlsException] if no common profile is found.
          */
-        //TODO: typealias for SRTPProtectionProfileArray?
-        fun chooseSrtpProtectionProfile(ours: IntArray, theirs: IntArray): Int {
+        fun chooseSrtpProtectionProfile(ours: Iterable<Int>, theirs: Iterable<Int>): Int {
             return try {
-                theirs.first(ours::contains)
+                ours.first(theirs::contains)
             } catch (e: NoSuchElementException) {
-                //TODO: define a value mapped to 0 which is something like "INVALID_SRTP_PROTECTION_PROFILE"
-                0
+                throw DtlsException(
+                    "No common SRTP protection profile found.  Ours: ${ours.joinToString()} " +
+                        "Theirs: ${theirs.joinToString()}"
+                )
             }
         }
 
         /**
-         * Computes the fingerprint of a [certificate] using [hashFunction] and return it
+         * Generate an x509 certificate valid from 1 day ago until 7 days from now.
+         *
+         * TODO: make the algorithm dynamic (passed in) to support older dtls versions/clients
+         */
+        private fun generateCertificate(
+            subject: X500Name,
+            keyPair: KeyPair
+        ): Certificate {
+            val now = System.currentTimeMillis()
+            val startDate = Date(now - Duration.ofDays(1).toMillis())
+            val expiryDate = Date(now + Duration.ofDays(7).toMillis())
+            val serialNumber = BigInteger.valueOf(now)
+
+            val certBuilder = JcaX509v3CertificateBuilder(
+                subject,
+                serialNumber,
+                startDate,
+                expiryDate,
+                subject,
+                keyPair.public
+            )
+            val signer = JcaContentSignerBuilder("SHA256withECDSA").build(keyPair.private)
+
+            return certBuilder.build(signer).toASN1Structure()
+        }
+
+        /**
+         * Generate an eliptic-curve keypair using the secp256r1 named curve:
+         * "All Implementations MUST implement DTLS 1.2 with the
+         * TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 cipher suite and the P-256
+         * curve"
+         *
+         * --https://tools.ietf.org/html/draft-ietf-rtcweb-security-arch-18#section-6.5
+         *
+         * NOTE(brian): I used 'secp256r1' specifically because it's what I saw in wireshark traces from chrome
+         */
+        private fun generateEcKeyPair(): KeyPair {
+            val keyGen = KeyPairGenerator.getInstance("EC", "BC")
+            val ecCurveSpec = ECNamedCurveTable.getParameterSpec("secp256r1")
+
+            keyGen.initialize(ecCurveSpec)
+
+            return keyGen.generateKeyPair()
+        }
+
+        /**
+         * Generate an [X500Name] using the given [appName] and [appVersion]
+         */
+        private fun generateCN(appName: String, appVersion: String): X500Name {
+            val builder = X500NameBuilder(BCStyle.INSTANCE)
+            val rdn = "$appName $appVersion"
+            builder.addRDN(BCStyle.CN, rdn)
+            return builder.build()
+        }
+
+        /**
+         * Verifies and validates a specific certificate against the fingerprints
+         * presented by the remote endpoint via the signaling path.
+         *
+         * @param certificateInfo the certificate to be verified and validated against
+         * the fingerprints presented by the remote endpoint via the signaling path
+         * @throws [DtlsException] if [certificateInfo] fails validation
+         */
+        fun verifyAndValidateCertificate(
+            certificateInfo: org.bouncycastle.tls.Certificate,
+            remoteFingerprints: Map<String, String>
+        ) {
+
+            if (certificateInfo.certificateList.isEmpty()) {
+                throw DtlsException("No remote fingerprints.")
+            }
+            for (currCertificate in certificateInfo.certificateList) {
+                val x509Cert = org.bouncycastle.asn1.x509.Certificate.getInstance(currCertificate.encoded)
+                verifyAndValidateCertificate(x509Cert, remoteFingerprints)
+            }
+        }
+
+        /**
+         * Verifies and validates a specific certificate against the fingerprints
+         * presented by the remote endpoint via the signaling path.
+         *
+         * @param certificate the certificate to be verified and validated against
+         * the fingerprints presented by the remote endpoint via the signaling path.
+         * @throws DtlsException if the specified [certificate] failed to verify
+         * and validate against the fingerprints presented by the remote endpoint
+         * via the signaling path.
+         */
+        private fun verifyAndValidateCertificate(
+            certificate: org.bouncycastle.asn1.x509.Certificate,
+            remoteFingerprints: Map<String, String>
+        ) {
+            // RFC 4572 "Connection-Oriented Media Transport over the Transport
+            // Layer Security (TLS) Protocol in the Session Description Protocol
+            // (SDP)" defines that "[a] certificate fingerprint MUST be computed
+            // using the same one-way hash function as is used in the certificate's
+            // signature algorithm."
+
+            val hashFunction = certificate.getHashFunction()
+
+            // As RFC 5763 "Framework for Establishing a Secure Real-time Transport
+            // Protocol (SRTP) Security Context Using Datagram Transport Layer
+            // Security (DTLS)" states, "the certificate presented during the DTLS
+            // handshake MUST match the fingerprint exchanged via the signaling path
+            // in the SDP."
+            val remoteFingerprint = remoteFingerprints[hashFunction] ?: throw DtlsException(
+                "No fingerprint declared over the signaling path with hash function: $hashFunction"
+            )
+
+            // TODO(boris) check if the below is still true, and re-introduce the hack if it is.
+            // Unfortunately, Firefox does not comply with RFC 5763 at the time
+            // of this writing. Its certificate uses SHA-1 and it sends a
+            // fingerprint computed with SHA-256. We could, of course, wait for
+            // Mozilla to make Firefox compliant. However, we would like to
+            // support Firefox in the meantime. That is why we will allow the
+            // fingerprint to "upgrade" the hash function of the certificate
+            // much like SHA-256 is an "upgrade" of SHA-1.
+            /*
+            if (remoteFingerprint == null)
+            {
+                val hashFunctionUpgrade = findHashFunctionUpgrade(hashFunction, remoteFingerprints)
+
+                if (hashFunctionUpgrade != null
+                        && !hashFunctionUpgrade.equalsIgnoreCase(hashFunction)) {
+                    fingerprint = fingerprints[hashFunctionUpgrade]
+                    if (fingerprint != null)
+                        hashFunction = hashFunctionUpgrade
+                }
+            }
+            */
+
+            val certificateFingerprint = certificate.getFingerprint(hashFunction)
+
+            if (remoteFingerprint != certificateFingerprint) {
+                throw DtlsException(
+                    "Fingerprint $remoteFingerprint does not match the $hashFunction-hashed " +
+                        "certificate $certificateFingerprint"
+                )
+            }
+        }
+
+        /**
+         * Determine and return the hash function (as a [String]) used by this certificate
+         */
+        private fun org.bouncycastle.asn1.x509.Certificate.getHashFunction(): String {
+            val digAlgId = DefaultDigestAlgorithmIdentifierFinder().find(signatureAlgorithm)
+
+            return BcDefaultDigestProvider.INSTANCE
+                .get(digAlgId)
+                .algorithmName
+                .toLowerCase()
+        }
+
+        /**
+         * Computes the fingerprint of a [org.bouncycastle.asn1.x509.Certificate] using [hashFunction] and returns it
          * as a [String]
          */
-        fun computeFingerprint(certificate: org.bouncycastle.asn1.x509.Certificate, hashFunction: String): String {
+        private fun org.bouncycastle.asn1.x509.Certificate.getFingerprint(hashFunction: String): String {
             val digAlgId = DefaultDigestAlgorithmIdentifierFinder().find(hashFunction.toUpperCase())
             val digest = BcDefaultDigestProvider.INSTANCE.get(digAlgId)
-            val input: ByteArray = certificate.getEncoded(ASN1Encoding.DER)
-            val output: ByteArray = ByteArray(digest.digestSize)
+            val input: ByteArray = getEncoded(ASN1Encoding.DER)
+            val output = ByteArray(digest.digestSize)
 
-            digest.update(input, 0, input.size);
-            digest.doFinal(output, 0);
+            digest.update(input, 0, input.size)
+            digest.doFinal(output, 0)
 
             return output.toFingerprint()
         }
@@ -83,100 +281,82 @@ class DtlsUtils {
             return buf.toString()
         }
 
-        /**
-         * Determine and return the hash function (as a [String]) used by this certificate
+        /*
+         * Copied from TlsContext#exportKeyingMaterial and modified to work with
+         * an externally provided masterSecret value.
          */
-        private fun org.bouncycastle.asn1.x509.Certificate.getHash(): String {
-            val digAlgId = DefaultDigestAlgorithmIdentifierFinder().find(signatureAlgorithm)
+        fun exportKeyingMaterial(
+            context: TlsContext,
+            asciiLabel: String,
+            context_value: ByteArray?,
+            length: Int,
+            masterSecret: TlsSecret
+        ): ByteArray {
+            if (context_value != null && !TlsUtils.isValidUint16(context_value.size)) {
+                throw IllegalArgumentException("'context_value' must have a length less than 2^16 (or be null)")
+            }
+            val sp = context.securityParameters
+            val cr = sp.clientRandom
+            val sr = sp.serverRandom
 
-            return BcDefaultDigestProvider.INSTANCE
-                .get(digAlgId)
-                .algorithmName
-                .toLowerCase()
+            var seedLength = cr.size + sr.size
+            if (context_value != null) {
+                seedLength += (2 + context_value.size)
+            }
+
+            val seed = ByteArray(seedLength)
+            var seedPos = 0
+
+            System.arraycopy(cr, 0, seed, seedPos, cr.size)
+            seedPos += cr.size
+            System.arraycopy(sr, 0, seed, seedPos, sr.size)
+            seedPos += sr.size
+
+            if (context_value != null) {
+                TlsUtils.writeUint16(context_value.size, seed, seedPos)
+                seedPos += 2
+                System.arraycopy(context_value, 0, seed, seedPos, context_value.size)
+                seedPos += context_value.size
+            }
+
+            if (seedPos != seedLength) {
+                throw IllegalStateException("error in calculation of seed for export")
+            }
+
+            return TlsUtils.PRF(context, masterSecret, asciiLabel, seed, length).extract()
         }
+    }
 
-        private val RSA_KEY_PUBLIC_EXPONENT = BigInteger("10001", 16)
-        private const val RSA_KEY_SIZE = 1024
-        private const val RSA_KEY_SIZE_CERTAINTY = 80
-        /**
-         * Return a pair of RSA private and public keys.
-         */
-        fun generateRsaKeyPair(): AsymmetricCipherKeyPair {
-            val generator = RSAKeyPairGenerator();
-            generator.init(
-                RSAKeyGenerationParameters(
-                        RSA_KEY_PUBLIC_EXPONENT,
-                SecureRandom(),
-                RSA_KEY_SIZE,
-                RSA_KEY_SIZE_CERTAINTY)
-            );
-            return generator.generateKeyPair();
+    class DtlsException(msg: String) : Exception(msg)
+}
+
+@Suppress("NOTHING_TO_INLINE") // Avoid adding to the trace in the log file
+inline fun Logger.notifyAlertRaised(alertLevel: Short, alertDescription: Short, message: String?, cause: Throwable?) {
+    when (alertDescription) {
+        AlertDescription.close_notify -> cdebug { "close_notify raised, connection closing" }
+        else -> {
+            val stack = with(StringBuffer()) {
+                val e = Exception()
+                for (el in e.stackTrace) {
+                    appendln(el.toString())
+                }
+                toString()
+            }
+            cinfo {
+                "Alert raised: level=$alertLevel, description=$alertDescription, message=$message " +
+                    "cause=$cause $stack"
+            }
         }
+    }
+}
 
-        /**
-         * Generates a new subject for a self-signed certificate to be generated by
-         * <tt>DtlsControlImpl</tt>.
-         *
-         * @return an <tt>X500Name</tt> which is to be used as the subject of a
-         * self-signed certificate to be generated by <tt>DtlsControlImpl</tt>
-         */
-        fun generateCN(appName: String, appVersion: String): X500Name {
-            val builder = X500NameBuilder(BCStyle.INSTANCE)
-            val rdn = "$appName $appVersion"
-            builder.addRDN(BCStyle.CN, rdn)
-            return builder.build()
-        }
-
-        /**
-         * Generates a new self-signed certificate with a specific subject and a
-         * specific pair of private and public keys.
-         *
-         * @param subject the subject (and issuer) of the new certificate to be
-         * generated
-         * @param keyPair the pair of private and public keys of the certificate to
-         * be generated
-         * @return a new self-signed certificate with the specified
-         * <tt>subject</tt> and <tt>keyPair</tt>
-         */
-        fun generateX509Certificate(
-                subject: X500Name,
-                keyPair: AsymmetricCipherKeyPair,
-                signatureAlgo: String = "SHA1withRSA"
-        ): org.bouncycastle.asn1.x509.Certificate {
-            val now = System.currentTimeMillis()
-            val notBefore = Date(now - Duration.ofDays(1).toMillis())
-            val notAfter = Date(now + Duration.ofDays(7).toMillis())
-            val certBuilder = X509v3CertificateBuilder(
-                subject,
-                BigInteger.valueOf(now),
-                notBefore,
-                notAfter,
-                subject,
-                SubjectPublicKeyInfoFactory.createSubjectPublicKeyInfo(keyPair.public)
-            )
-            val signatureAlgoIdentifier = DefaultSignatureAlgorithmIdentifierFinder().find(signatureAlgo)
-            val digestAlgoIdentifier = DefaultDigestAlgorithmIdentifierFinder().find(signatureAlgoIdentifier)
-            val signer = BcRSAContentSignerBuilder(signatureAlgoIdentifier, digestAlgoIdentifier).build(keyPair.private)
-            return certBuilder.build(signer).toASN1Structure()
-        }
-
-        /**
-         * Generates a new certificate from a new key pair, determines the hash
-         * function, and computes the fingerprint.
-         *
-         * @return CertificateInfo a new certificate generated from a new key pair,
-         * its hash function, and fingerprint
-         */
-        fun generateCertificateInfo(): CertificateInfo {
-            val keyPair = generateRsaKeyPair()
-
-            val x509Certificate = generateX509Certificate(generateCN("TODO-APP-NAME", "TODO-APP-VERSION"), keyPair)
-            val localFingerprintHashFunction = x509Certificate.getHash()
-            val localFingerprint = computeFingerprint(x509Certificate, localFingerprintHashFunction)
-
-            val now = System.currentTimeMillis()
-            val tlsCert = org.bouncycastle.crypto.tls.Certificate(arrayOf(x509Certificate))
-            return CertificateInfo(keyPair, tlsCert, localFingerprintHashFunction, localFingerprint, now)
+@Suppress("NOTHING_TO_INLINE") // Avoid adding to the trace in the log file
+inline fun Logger.notifyAlertReceived(alertLevel: Short, alertDescription: Short) {
+    when (alertDescription) {
+        AlertDescription.close_notify -> cinfo { "close_notify received, connection closing" }
+        else -> cerror {
+            "Alert received: level=$alertLevel, description=$alertDescription " +
+                "(${AlertDescription.getName(alertDescription)})"
         }
     }
 }

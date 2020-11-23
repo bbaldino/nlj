@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,42 +15,43 @@
  */
 package org.jitsi.nlj.srtp
 
-import org.bouncycastle.crypto.tls.ExporterLabel
-import org.bouncycastle.crypto.tls.SRTPProtectionProfile
-import org.bouncycastle.crypto.tls.TlsClientContext
-import org.bouncycastle.crypto.tls.TlsContext
-import org.bouncycastle.crypto.tls.TlsServerContext
-import org.jitsi.impl.neomedia.transform.SinglePacketTransformer
-import org.jitsi.impl.neomedia.transform.srtp.SRTCPTransformer
-import org.jitsi.impl.neomedia.transform.srtp.SRTPContextFactory
-import org.jitsi.impl.neomedia.transform.srtp.SRTPPolicy
-import org.jitsi.impl.neomedia.transform.srtp.SRTPTransformer
+import org.bouncycastle.tls.SRTPProtectionProfile
+import org.jitsi.srtp.SrtpContextFactory
+import org.jitsi.srtp.SrtpPolicy
+import org.jitsi.srtp.crypto.Aes
+import org.jitsi.utils.logging2.Logger
 
 enum class TlsRole {
     CLIENT,
     SERVER;
-
-    companion object {
-        fun fromTlsContext(tlsContext: TlsContext): TlsRole {
-            return when (tlsContext) {
-                is TlsClientContext -> CLIENT
-                is TlsServerContext -> SERVER
-                else -> throw Exception("Unsupported tls role: ${tlsContext::class}")
-            }
-        }
-    }
 }
 
 class SrtpUtil {
     companion object {
+        init {
+            SrtpConfig.factoryClass?.let { Aes.setFactoryClassName(it) }
+        }
+
+        fun getSrtpProtectionProfileFromName(profileName: String): Int {
+            return when (profileName) {
+                "SRTP_AES128_CM_HMAC_SHA1_80" -> { SRTPProtectionProfile.SRTP_AES128_CM_HMAC_SHA1_80 }
+                "SRTP_AES128_CM_HMAC_SHA1_32" -> { SRTPProtectionProfile.SRTP_AES128_CM_HMAC_SHA1_32 }
+                "SRTP_NULL_HMAC_SHA1_32" -> { SRTPProtectionProfile.SRTP_NULL_HMAC_SHA1_32 }
+                "SRTP_NULL_HMAC_SHA1_80" -> { SRTPProtectionProfile.SRTP_NULL_HMAC_SHA1_80 }
+                "SRTP_AEAD_AES_128_GCM" -> { SRTPProtectionProfile.SRTP_AEAD_AES_128_GCM }
+                "SRTP_AEAD_AES_256_GCM" -> { SRTPProtectionProfile.SRTP_AEAD_AES_256_GCM }
+                else -> throw IllegalArgumentException("Unsupported SRTP protection profile: $profileName")
+            }
+        }
+
         fun getSrtpProfileInformationFromSrtpProtectionProfile(srtpProtectionProfile: Int): SrtpProfileInformation {
             return when (srtpProtectionProfile) {
                 SRTPProtectionProfile.SRTP_AES128_CM_HMAC_SHA1_32 -> {
                     SrtpProfileInformation(
                         cipherKeyLength = 128 / 8,
                         cipherSaltLength = 112 / 8,
-                        cipherName = SRTPPolicy.AESCM_ENCRYPTION,
-                        authFunctionName = SRTPPolicy.HMACSHA1_AUTHENTICATION,
+                        cipherName = SrtpPolicy.AESCM_ENCRYPTION,
+                        authFunctionName = SrtpPolicy.HMACSHA1_AUTHENTICATION,
                         authKeyLength = 160 / 8,
                         rtcpAuthTagLength = 80 / 8,
                         rtpAuthTagLength = 32 / 8
@@ -60,8 +61,8 @@ class SrtpUtil {
                     SrtpProfileInformation(
                         cipherKeyLength = 128 / 8,
                         cipherSaltLength = 112 / 8,
-                        cipherName = SRTPPolicy.AESCM_ENCRYPTION,
-                        authFunctionName = SRTPPolicy.HMACSHA1_AUTHENTICATION,
+                        cipherName = SrtpPolicy.AESCM_ENCRYPTION,
+                        authFunctionName = SrtpPolicy.HMACSHA1_AUTHENTICATION,
                         authKeyLength = 160 / 8,
                         rtcpAuthTagLength = 80 / 8,
                         rtpAuthTagLength = 80 / 8
@@ -71,8 +72,8 @@ class SrtpUtil {
                     SrtpProfileInformation(
                         cipherKeyLength = 0,
                         cipherSaltLength = 0,
-                        cipherName = SRTPPolicy.NULL_ENCRYPTION,
-                        authFunctionName = SRTPPolicy.HMACSHA1_AUTHENTICATION,
+                        cipherName = SrtpPolicy.NULL_ENCRYPTION,
+                        authFunctionName = SrtpPolicy.HMACSHA1_AUTHENTICATION,
                         authKeyLength = 160 / 8,
                         rtcpAuthTagLength = 80 / 8,
                         rtpAuthTagLength = 32 / 8
@@ -82,31 +83,45 @@ class SrtpUtil {
                     SrtpProfileInformation(
                         cipherKeyLength = 0,
                         cipherSaltLength = 0,
-                        cipherName = SRTPPolicy.NULL_ENCRYPTION,
-                        authFunctionName = SRTPPolicy.HMACSHA1_AUTHENTICATION,
+                        cipherName = SrtpPolicy.NULL_ENCRYPTION,
+                        authFunctionName = SrtpPolicy.HMACSHA1_AUTHENTICATION,
                         authKeyLength = 160 / 8,
                         rtcpAuthTagLength = 80 / 8,
                         rtpAuthTagLength = 80 / 8
+                    )
+                }
+                SRTPProtectionProfile.SRTP_AEAD_AES_128_GCM -> {
+                    SrtpProfileInformation(
+                        cipherKeyLength = 128 / 8,
+                        cipherSaltLength = 96 / 8,
+                        cipherName = SrtpPolicy.AESGCM_ENCRYPTION,
+                        authFunctionName = SrtpPolicy.NULL_AUTHENTICATION,
+                        authKeyLength = 0,
+                        rtcpAuthTagLength = 128 / 8,
+                        rtpAuthTagLength = 128 / 8
+                    )
+                }
+                SRTPProtectionProfile.SRTP_AEAD_AES_256_GCM -> {
+                    SrtpProfileInformation(
+                        cipherKeyLength = 256 / 8,
+                        cipherSaltLength = 96 / 8,
+                        cipherName = SrtpPolicy.AESGCM_ENCRYPTION,
+                        authFunctionName = SrtpPolicy.NULL_AUTHENTICATION,
+                        authKeyLength = 0,
+                        rtcpAuthTagLength = 128 / 8,
+                        rtpAuthTagLength = 128 / 8
                     )
                 }
                 else -> throw IllegalArgumentException("Unsupported SRTP protection profile: $srtpProtectionProfile")
             }
         }
 
-        fun getKeyingMaterial(tlsContext: TlsContext, srtpProfileInformation: SrtpProfileInformation): ByteArray {
-            return tlsContext.exportKeyingMaterial(
-                ExporterLabel.dtls_srtp,
-                null,
-                2 * (srtpProfileInformation.cipherKeyLength + srtpProfileInformation.cipherSaltLength)
-            )
-        }
-
         fun initializeTransformer(
             srtpProfileInformation: SrtpProfileInformation,
             keyingMaterial: ByteArray,
             tlsRole: TlsRole,
-            isRtcp: Boolean
-        ): SinglePacketTransformer {
+            parentLogger: Logger
+        ): SrtpTransformers {
             val clientWriteSrtpMasterKey = ByteArray(srtpProfileInformation.cipherKeyLength)
             val serverWriteSrtpMasterKey = ByteArray(srtpProfileInformation.cipherKeyLength)
             val clientWriterSrtpMasterSalt = ByteArray(srtpProfileInformation.cipherSaltLength)
@@ -122,13 +137,15 @@ class SrtpUtil {
             for (i in 0 until keyingMaterialValues.size) {
                 val keyingMaterialValue = keyingMaterialValues[i]
 
-                System.arraycopy(keyingMaterial, keyingMaterialOffset,
+                System.arraycopy(
+                    keyingMaterial, keyingMaterialOffset,
                     keyingMaterialValue, 0,
-                    keyingMaterialValue.size)
+                    keyingMaterialValue.size
+                )
                 keyingMaterialOffset += keyingMaterialValue.size
             }
 
-            val srtcpPolicy = SRTPPolicy(
+            val srtcpPolicy = SrtpPolicy(
                 srtpProfileInformation.cipherName,
                 srtpProfileInformation.cipherKeyLength,
                 srtpProfileInformation.authFunctionName,
@@ -136,7 +153,7 @@ class SrtpUtil {
                 srtpProfileInformation.rtcpAuthTagLength,
                 srtpProfileInformation.cipherSaltLength
             )
-            val srtpPolicy = SRTPPolicy(
+            val srtpPolicy = SrtpPolicy(
                 srtpProfileInformation.cipherName,
                 srtpProfileInformation.cipherKeyLength,
                 srtpProfileInformation.authFunctionName,
@@ -145,22 +162,29 @@ class SrtpUtil {
                 srtpProfileInformation.cipherSaltLength
             )
 
-            val clientSrtpContextFactory = SRTPContextFactory(
+            /* To support RetransmissionSender.retransmitPlain, we need to disable
+               send-side SRTP replay protection. */
+            /* TODO: disable this only in cases where we actually need to use retransmitPlain? */
+            srtpPolicy.isSendReplayEnabled = false
+
+            val clientSrtpContextFactory = SrtpContextFactory(
                 tlsRole == TlsRole.CLIENT,
                 clientWriteSrtpMasterKey,
                 clientWriterSrtpMasterSalt,
                 srtpPolicy,
-                srtcpPolicy
+                srtcpPolicy,
+                parentLogger
             )
-            val serverSrtpContextFactory = SRTPContextFactory(
+            val serverSrtpContextFactory = SrtpContextFactory(
                 tlsRole == TlsRole.SERVER,
                 serverWriteSrtpMasterKey,
                 serverWriterSrtpMasterSalt,
                 srtpPolicy,
-                srtcpPolicy
+                srtcpPolicy,
+                parentLogger
             )
-            val forwardSrtpContextFactory: SRTPContextFactory
-            val reverseSrtpContextFactory: SRTPContextFactory
+            val forwardSrtpContextFactory: SrtpContextFactory
+            val reverseSrtpContextFactory: SrtpContextFactory
 
             when (tlsRole) {
                 TlsRole.CLIENT -> {
@@ -173,12 +197,12 @@ class SrtpUtil {
                 }
             }
 
-            return if (isRtcp) {
-                SRTCPTransformer(forwardSrtpContextFactory, reverseSrtpContextFactory)
-            } else {
-                SRTPTransformer(forwardSrtpContextFactory, reverseSrtpContextFactory)
-            }
-
+            return SrtpTransformers(
+                SrtpDecryptTransformer(reverseSrtpContextFactory, parentLogger),
+                SrtpEncryptTransformer(forwardSrtpContextFactory, parentLogger),
+                SrtcpDecryptTransformer(reverseSrtpContextFactory, parentLogger),
+                SrtcpEncryptTransformer(forwardSrtpContextFactory, parentLogger)
+            )
         }
     }
 }

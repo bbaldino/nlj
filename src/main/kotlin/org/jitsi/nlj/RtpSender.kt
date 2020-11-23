@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,37 +15,34 @@
  */
 package org.jitsi.nlj
 
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.impl.neomedia.transform.SinglePacketTransformer
-import org.jitsi.nlj.rtcp.NackHandler
+import org.jitsi.nlj.rtp.TransportCcEngine
+import org.jitsi.nlj.rtp.bandwidthestimation.BandwidthEstimator
+import org.jitsi.nlj.srtp.SrtpTransformers
+import org.jitsi.nlj.stats.EndpointConnectionStats
+import org.jitsi.nlj.stats.PacketStreamStats
 import org.jitsi.nlj.transform.NodeStatsProducer
-import org.jitsi.nlj.transform.node.outgoing.OutgoingStreamStatistics
-import org.jitsi.rtp.rtcp.RtcpPacket
-
+import org.jitsi.nlj.transform.node.outgoing.OutgoingStatisticsSnapshot
 
 /**
  * Not an 'RtpSender' in the sense that it sends only RTP (and not
  * RTCP) but in the sense of a webrtc 'RTCRTPSender' which handles
  * all RTP and RTP control packets.
  */
-abstract class RtpSender : EventHandler, Stoppable,NodeStatsProducer {
-    var numPacketsSent = 0
-    var numBytesSent: Long = 0
-    var firstPacketSentTime: Long = -1
-    var lastPacketSentTime: Long = -1
-    var packetSender: Node = object : Node("RtpSender packet sender") {
-        override fun doProcessPackets(p: List<PacketInfo>) {
-            if (firstPacketSentTime == -1L) {
-                firstPacketSentTime = System.currentTimeMillis()
-            }
-            numPacketsSent += p.size
-            p.forEach { pktInfo -> numBytesSent += pktInfo.packet.size }
-            lastPacketSentTime = System.currentTimeMillis()
-        }
-    }
-    abstract fun sendPackets(pkts: List<PacketInfo>)
-    abstract fun sendRtcp(pkts: List<RtcpPacket>)
-    abstract fun setSrtpTransformer(srtpTransformer: SinglePacketTransformer)
-    abstract fun setSrtcpTransformer(srtcpTransformer: SinglePacketTransformer)
-    abstract fun getStreamStats(): Map<Long, OutgoingStreamStatistics.Snapshot>
+abstract class RtpSender :
+    StatsKeepingPacketHandler(),
+    EventHandler,
+    Stoppable,
+    NodeStatsProducer,
+    EndpointConnectionStats.EndpointConnectionStatsListener {
+
+    abstract fun sendProbing(mediaSsrcs: Collection<Long>, numBytes: Int): Int
+    abstract fun onOutgoingPacket(handler: PacketHandler)
+    abstract fun setSrtpTransformers(srtpTransformers: SrtpTransformers)
+    abstract fun getStreamStats(): OutgoingStatisticsSnapshot
+    abstract fun getPacketStreamStats(): PacketStreamStats.Snapshot
+    abstract fun getTransportCcEngineStats(): TransportCcEngine.StatisticsSnapshot
+    abstract fun requestKeyframe(mediaSsrc: Long? = null)
+    abstract fun tearDown()
+
+    abstract val bandwidthEstimator: BandwidthEstimator
 }

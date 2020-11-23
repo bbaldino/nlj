@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,110 +15,82 @@
  */
 package org.jitsi.nlj.transform.node.incoming
 
-import org.jitsi.nlj.Event
-import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.RtpPayloadTypeAddedEvent
-import org.jitsi.nlj.RtpPayloadTypeClearEvent
-import org.jitsi.nlj.SsrcAssociationEvent
-import org.jitsi.nlj.forEachAs
-import org.jitsi.nlj.stats.NodeStatsBlock
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.util.cdebug
-import org.jitsi.nlj.util.cerror
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.rtp.RtpPacket
-import org.jitsi.rtp.RtxPacket
-import org.jitsi.service.neomedia.codec.Constants
-import org.jitsi.util.Logger
-import unsigned.toUInt
 import java.util.concurrent.ConcurrentHashMap
+import org.jitsi.nlj.PacketInfo
+import org.jitsi.nlj.format.RtxPayloadType
+import org.jitsi.nlj.rtp.RtxPacket
+import org.jitsi.nlj.stats.NodeStatsBlock
+import org.jitsi.nlj.transform.node.TransformerNode
+import org.jitsi.nlj.util.ReadOnlyStreamInformationStore
+import org.jitsi.utils.logging2.cdebug
+import org.jitsi.rtp.extensions.unsigned.toPositiveInt
+import org.jitsi.rtp.rtp.RtpPacket
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.logging2.createChildLogger
 
 /**
  * Handle incoming RTX packets to strip the RTX information and make them
  * look like their original packets.
  * https://tools.ietf.org/html/rfc4588
  */
-class RtxHandler : Node("RTX handler") {
-    var numPaddingPacketsReceived = 0
-    var numRtxPacketsReceived = 0
+class RtxHandler(
+    private val streamInformationStore: ReadOnlyStreamInformationStore,
+    parentLogger: Logger
+) : TransformerNode("RTX handler") {
+    private val logger = createChildLogger(parentLogger)
+    private var numPaddingPacketsReceived = 0
+    private var numRtxPacketsReceived = 0
     /**
-     * Maps the RTX payload types to their associated video payload types
+     * Maps the Integer payload type of RTX to the [RtxPayloadType] instance.  We do this
+     * so we can look up the associated (original) payload type from the [RtxPayloadType]
+     * instance quickly via the Int RTX payload type in an incoming RTX packet.
      */
-    private val associatedPayloadTypes: ConcurrentHashMap<Int, Int> = ConcurrentHashMap()
-    /**
-     * Map the RTX stream ssrcs to their corresponding media ssrcs
-     */
-    private val associatedSsrcs: ConcurrentHashMap<Long, Long> = ConcurrentHashMap()
+    private val rtxPtToRtxPayloadType = ConcurrentHashMap<Int, RtxPayloadType>()
 
-    companion object {
-        val logger: Logger = Logger.getLogger(this::class.java)
+    init {
+        streamInformationStore.onRtpPayloadTypesChanged { currentPayloadTypes ->
+            rtxPtToRtxPayloadType.clear()
+            currentPayloadTypes.values
+                .filterIsInstance<RtxPayloadType>()
+                .map {
+                    rtxPtToRtxPayloadType[it.pt.toPositiveInt()] = it
+                }
+        }
     }
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        val outPackets = mutableListOf<PacketInfo>()
-        p.forEachAs<RtpPacket> { packetInfo, pkt ->
-            if (associatedPayloadTypes.containsKey(pkt.header.payloadType)) {
-                val rtxPacket = RtxPacket(pkt.getBuffer())
-//                logger.cdebug { "Received RTX packet: ssrc ${rtxPacket.header.ssrc}, seq num: ${rtxPacket.header.sequenceNumber} " +
-//                        "rtx payload size: ${rtxPacket.payload.limit()}, padding size: ${rtxPacket.getPaddingSize()} " +
-//                        "buffer:\n${rtxPacket.getBuffer().toHex()}" }
-                if (rtxPacket.payload.limit() - rtxPacket.getPaddingSize() < 2) {
-                    logger.cdebug { "RTX packet is padding, ignore" }
-                    numPaddingPacketsReceived++
-                    return@forEachAs
-                }
-                val originalSeqNum = rtxPacket.originalSequenceNumber
-                val originalPt = associatedPayloadTypes[pkt.header.payloadType]!!
-                val originalSsrc = associatedSsrcs[pkt.header.ssrc]!!
-
-                val originalPacket = rtxPacket.toRtpPacket()
-                originalPacket.header.sequenceNumber = originalSeqNum
-                originalPacket.header.payloadType = originalPt
-                originalPacket.header.ssrc = originalSsrc
-                logger.cdebug { "Recovered RTX packet.  Original packet: $originalSsrc $originalSeqNum" }
-                numRtxPacketsReceived++
-                packetInfo.packet = originalPacket
-                outPackets.add(packetInfo)
-            } else {
-                outPackets.add(packetInfo)
-            }
+    override fun transform(packetInfo: PacketInfo): PacketInfo? {
+        val rtpPacket = packetInfo.packetAs<RtpPacket>()
+        val rtxPayloadType = rtxPtToRtxPayloadType[rtpPacket.payloadType.toPositiveInt()] ?: return packetInfo
+        val originalSsrc = streamInformationStore.getLocalPrimarySsrc(rtpPacket.ssrc) ?: return packetInfo
+        // We do this check only after verifying we determine it's an RTX packet by finding
+        // the associated payload type and SSRC above
+        if (rtpPacket.payloadLength - rtpPacket.paddingSize < 2) {
+            logger.cdebug { "RTX packet is padding, ignore" }
+            numPaddingPacketsReceived++
+            return null
         }
-        next(outPackets)
-    }
+        val originalSeqNum = RtxPacket.getOriginalSequenceNumber(rtpPacket)
+        val originalPt = rtxPayloadType.associatedPayloadType
 
-    override fun handleEvent(event: Event) {
-        when (event) {
-            is RtpPayloadTypeAddedEvent -> {
-                if (Constants.RTX.equals(event.format.encoding, true)) {
-                    val rtxPt = event.payloadType.toUInt()
-                    event.format.formatParameters["apt"]?.toByte()?.toUInt()?.let {
-                        val associatedPt = it
-                        logger.cinfo { "RtxHandler associating RTX payload type $rtxPt with primary $associatedPt" }
-                        associatedPayloadTypes[rtxPt] = associatedPt
-                    } ?: run {
-                        logger.cerror { "Unable to parse RTX associated payload type from event: $event" }
-                    }
-                }
-            }
-            is RtpPayloadTypeClearEvent -> {
-                associatedPayloadTypes.clear()
-            }
-            is SsrcAssociationEvent -> {
-                if (event.type.equals(Constants.RTX)) {
-                    logger.cinfo { "RtxHandler associating RTX ssrc ${event.secondarySsrc} with primary ${event.primarySsrc}" }
-                    associatedSsrcs[event.secondarySsrc] = event.primarySsrc
-                }
-            }
-        }
-        super.handleEvent(event)
+        // Move the payload 2 bytes to the left
+        RtxPacket.removeOriginalSequenceNumber(rtpPacket)
+        rtpPacket.sequenceNumber = originalSeqNum
+        rtpPacket.payloadType = originalPt
+        rtpPacket.ssrc = originalSsrc
+
+        logger.cdebug { "Recovered RTX packet.  Original packet: $originalSsrc $originalSeqNum" }
+        numRtxPacketsReceived++
+        packetInfo.resetPayloadVerification()
+        return packetInfo
     }
 
     override fun getNodeStats(): NodeStatsBlock {
-        val parentStats = super.getNodeStats()
-        return NodeStatsBlock(name).apply {
-            addAll(parentStats)
-            addStat("num rtx packets received: $numRtxPacketsReceived")
-            addStat("num padding packets received: $numPaddingPacketsReceived")
+        return super.getNodeStats().apply {
+            addNumber("num_rtx_packets_received", numRtxPacketsReceived)
+            addNumber("num_padding_packets_received", numPaddingPacketsReceived)
+            addString("rtx_payload_types", rtxPtToRtxPayloadType.values.toString())
         }
     }
+
+    override fun trace(f: () -> Unit) = f.invoke()
 }

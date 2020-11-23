@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,49 +16,60 @@
 package org.jitsi.nlj.transform.node.incoming
 
 import org.jitsi.nlj.AudioLevelListener
-import org.jitsi.nlj.Event
 import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.RtpExtensionAddedEvent
-import org.jitsi.nlj.RtpExtensionClearEvent
-import org.jitsi.nlj.forEachAs
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.rtp.RtpPacket
-import org.jitsi.service.neomedia.RTPExtension
-import unsigned.toUInt
-import kotlin.experimental.and
+import org.jitsi.nlj.rtp.AudioRtpPacket
+import org.jitsi.nlj.rtp.RtpExtensionType.SSRC_AUDIO_LEVEL
+import org.jitsi.nlj.stats.NodeStatsBlock
+import org.jitsi.nlj.transform.node.ObserverNode
+import org.jitsi.nlj.util.ReadOnlyStreamInformationStore
+import org.jitsi.rtp.extensions.unsigned.toPositiveLong
+import org.jitsi.rtp.rtp.header_extensions.AudioLevelHeaderExtension
 
 /**
  * https://tools.ietf.org/html/rfc6464#section-3
  */
-class AudioLevelReader : Node("Audio level reader") {
+class AudioLevelReader(
+    streamInformationStore: ReadOnlyStreamInformationStore
+) : ObserverNode("Audio level reader") {
     private var audioLevelExtId: Int? = null
     var audioLevelListener: AudioLevelListener? = null
-    companion object {
-        const val MUTED_LEVEL = 127L
-    }
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        audioLevelExtId?.let { audioLevelId ->
-            p.forEachAs<RtpPacket> currPkt@ { _, pkt ->
-                val levelExt = pkt.header.getExtension(audioLevelId) ?: return@currPkt
-                val level = (levelExt.data.get() and 0x7F).toLong()
-                if (level != MUTED_LEVEL) {
-                    audioLevelListener?.onLevelReceived(pkt.header.ssrc, 127 - level)
-                }
-            }
+    private var numSilencePacketsDiscarded = 0
+
+    /**
+     * Whether or not we should forcibly mute this audio stream (by setting shouldDiscard to true)
+     */
+    var forceMute: Boolean = false
+
+    init {
+        streamInformationStore.onRtpExtensionMapping(SSRC_AUDIO_LEVEL) {
+            audioLevelExtId = it
         }
-        next(p)
     }
 
-    override fun handleEvent(event: Event) {
-        when (event) {
-            is RtpExtensionAddedEvent -> {
-                if (RTPExtension.SSRC_AUDIO_LEVEL_URN.equals(event.rtpExtension.uri.toString())) {
-                    audioLevelExtId = event.extensionId.toUInt()
-                    logger.cinfo { "Audio level reader setting extension ID to $audioLevelExtId" }
+    override fun observe(packetInfo: PacketInfo) {
+        val audioRtpPacket = packetInfo.packet as? AudioRtpPacket ?: return
+
+        audioLevelExtId?.let { audioLevelId ->
+            audioRtpPacket.getHeaderExtension(audioLevelId)?.let { ext ->
+                val level = AudioLevelHeaderExtension.getAudioLevel(ext)
+                if (level == MUTED_LEVEL || this.forceMute) {
+                    packetInfo.shouldDiscard = true
+                    numSilencePacketsDiscarded++
+                } else {
+                    audioLevelListener?.onLevelReceived(audioRtpPacket.ssrc, (127 - level).toPositiveLong())
                 }
             }
-            is RtpExtensionClearEvent -> audioLevelExtId = null
         }
+    }
+
+    override fun getNodeStats(): NodeStatsBlock = super.getNodeStats().apply {
+        addString("audio_level_ext_id", audioLevelExtId.toString())
+        addNumber("num_silence_packets_discarded", numSilencePacketsDiscarded)
+    }
+
+    override fun trace(f: () -> Unit) = f.invoke()
+
+    companion object {
+        const val MUTED_LEVEL = 127
     }
 }

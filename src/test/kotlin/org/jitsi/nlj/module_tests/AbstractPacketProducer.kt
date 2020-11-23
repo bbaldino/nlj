@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,13 +19,8 @@ import io.pkts.Pcap
 import io.pkts.packet.Packet
 import io.pkts.packet.UDPPacket
 import io.pkts.protocol.Protocol
-import org.jitsi.nlj.srtp.SrtpProfileInformation
-import org.jitsi.nlj.srtp.TlsRole
-import org.jitsi.rtp.UnparsedPacket
-import org.jitsi.rtp.util.ByteBufferUtils
-import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
-
+import org.jitsi.rtp.UnparsedPacket
 
 abstract class AbstractPacketProducer : PacketProducer {
     private val handlers = mutableListOf<PacketReceiver>()
@@ -39,39 +34,31 @@ abstract class AbstractPacketProducer : PacketProducer {
     }
 }
 
-data class SrtpInformation(
-    val srtpProfileInformation: SrtpProfileInformation,
-    val keyingMaterial: ByteArray,
-    val tlsRole: TlsRole
-)
-
-data class PcapFileInformation(
-    val filePath: String,
-    val srtpInformation: SrtpInformation
-)
-
 /**
  * Read data from a PCAP file and play it out at a rate consistent with the packet arrival times.  I.e. if the PCAP
  * file captured data flowing at 2mbps, this producer will play it out at 2mbps
  */
 class PcapPacketProducer(
-    pcapFileInformation: PcapFileInformation
+    pcapFilePath: String
 ) : AbstractPacketProducer() {
-    private val pcap = Pcap.openStream(pcapFileInformation.filePath)
+    private val pcap = Pcap.openStream(pcapFilePath)
     var running: Boolean = true
 
     companion object {
         private fun translateToUnparsedPacket(pktsPacket: Packet): UnparsedPacket {
-            val buf = if (pktsPacket.hasProtocol(Protocol.UDP)) {
+            // We always allocate a buffer with capacity 1500, so the packet has room to 'grow'
+            val packetBuf = ByteArray(1500)
+            return if (pktsPacket.hasProtocol(Protocol.UDP)) {
                 val udpPacket = pktsPacket.getPacket(Protocol.UDP) as UDPPacket
-                ByteBuffer.wrap(udpPacket.payload.array)
+                System.arraycopy(udpPacket.payload.array, 0, packetBuf, 0, udpPacket.payload.array.size)
+                UnparsedPacket(packetBuf, 0, udpPacket.payload.array.size)
             } else {
                 // When capturing on the loopback interface, the packets have a null ethernet
                 // frame which messes up the pkts libary's parsing, so instead use a hack to
                 // grab the buffer directly
-                ByteBufferUtils.wrapSubArray(pktsPacket.payload.rawArray, 32, pktsPacket.payload.rawArray.size - 32)
+                System.arraycopy(pktsPacket.payload.rawArray, 32, packetBuf, 0, pktsPacket.payload.rawArray.size - 32)
+                UnparsedPacket(packetBuf, 0, pktsPacket.payload.rawArray.size - 32)
             }
-            return UnparsedPacket(buf)
         }
 
         private fun nowMicros(): Long = System.nanoTime() / 1000

@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,45 +15,41 @@
  */
 package org.jitsi.nlj.transform.node.outgoing
 
-import org.jitsi.impl.neomedia.transform.AbsSendTimeEngine
-import org.jitsi.nlj.Event
 import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.RtpExtensionAddedEvent
-import org.jitsi.nlj.RtpExtensionClearEvent
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.nlj.util.getByteBuffer
-import org.jitsi.nlj.util.toRawPacket
-import org.jitsi.rtp.RtpPacket
-import org.jitsi.service.neomedia.RTPExtension
-import unsigned.toUInt
+import org.jitsi.nlj.rtp.RtpExtensionType.ABS_SEND_TIME
+import org.jitsi.nlj.stats.NodeStatsBlock
+import org.jitsi.nlj.transform.node.ModifierNode
+import org.jitsi.nlj.util.ReadOnlyStreamInformationStore
+import org.jitsi.rtp.rtp.RtpPacket
+import org.jitsi.rtp.rtp.header_extensions.AbsSendTimeHeaderExtension
 
-class AbsSendTime : Node("Absolute send time") {
-    private val absSendTimeEngine = AbsSendTimeEngine()
+class AbsSendTime(
+    streamInformationStore: ReadOnlyStreamInformationStore
+) : ModifierNode("Absolute send time") {
+    private var extensionId: Int? = null
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        p.forEach { pktInfo ->
-            val rawPacket = pktInfo.packet.toRawPacket()
-            absSendTimeEngine.transform(rawPacket)
-            // We 'lose' some information here because we have to recreate
-            // whatever this packet was as an RtpPacket, but I don't think
-            // this will be a problem.  Eventually we will port the old transformers
-            // over to Packet from RawPacket.
-            pktInfo.packet = RtpPacket(rawPacket.getByteBuffer())
-        }
-        next(p)
-    }
-
-    override fun handleEvent(event: Event) {
-        when (event) {
-            is RtpExtensionAddedEvent -> {
-                if (RTPExtension.ABS_SEND_TIME_URN.equals(event.rtpExtension.uri.toString())) {
-                    val absSendTimeExtId = event.extensionId.toUInt()
-                    absSendTimeEngine.setExtensionID(absSendTimeExtId)
-                    logger.cinfo { "AbsSendTime setting extension ID to $absSendTimeExtId" }
-                }
-            }
-            is RtpExtensionClearEvent -> absSendTimeEngine.setExtensionID(-1)
+    init {
+        streamInformationStore.onRtpExtensionMapping(ABS_SEND_TIME) {
+            extensionId = it
         }
     }
+
+    override fun modify(packetInfo: PacketInfo): PacketInfo {
+        extensionId?.let { absSendTimeExtId ->
+            val rtpPacket = packetInfo.packetAs<RtpPacket>()
+            val ext = rtpPacket.getHeaderExtension(absSendTimeExtId)
+                ?: rtpPacket.addHeaderExtension(absSendTimeExtId, AbsSendTimeHeaderExtension.DATA_SIZE_BYTES)
+            AbsSendTimeHeaderExtension.setTime(ext, System.nanoTime())
+        }
+
+        return packetInfo
+    }
+
+    override fun getNodeStats(): NodeStatsBlock {
+        return super.getNodeStats().apply {
+            addString("abs_send_time_ext_id", extensionId.toString())
+        }
+    }
+
+    override fun trace(f: () -> Unit) = f.invoke()
 }

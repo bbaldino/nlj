@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,12 @@
  */
 package org.jitsi.nlj
 
-import org.jitsi.rtp.Packet
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings
 import java.time.Duration
+import org.jitsi.rtp.Packet
+import java.util.Collections
 
+@SuppressFBWarnings("CN_IMPLEMENTS_CLONE_BUT_NOT_CLONEABLE")
 class EventTimeline(
     private val timeline: MutableList<Pair<String, Long>> = mutableListOf()
 ) : Iterable<Pair<String, Long>> {
@@ -46,19 +49,23 @@ class EventTimeline(
 
     /**
      * Return the total time between this packet's first event and last event
+     * or -1 if there is no reference time
      */
     fun totalDelay(): Duration {
         return referenceTime?.let {
-            return Duration.ofMillis(timeline.last().second - it)
-
-        } ?: Duration.ofMillis(0)
+            return Duration.ofMillis(timeline.last().second)
+        } ?: Duration.ofMillis(-1)
     }
 
     override fun toString(): String {
-        return with (StringBuffer()) {
-            appendln("Reference time: ${referenceTime}ms")
-            timeline.forEach {
-                appendln(it.toString())
+        return with(StringBuffer()) {
+            referenceTime?.let {
+                appendln("Reference time: ${referenceTime}ms")
+                timeline.forEach {
+                    appendln(it.toString())
+                }
+            } ?: run {
+                appendln("[No timeline]")
             }
             toString()
         }
@@ -71,20 +78,47 @@ class EventTimeline(
  * (as it is parsed into different types), the wrapping [PacketInfo] stays consistent
  * and allows for metadata to be passed along with a packet.
  */
-class PacketInfo @JvmOverloads constructor(
+@SuppressFBWarnings("CN_IMPLEMENTS_CLONE_BUT_NOT_CLONEABLE")
+open class PacketInfo @JvmOverloads constructor(
     var packet: Packet,
     val timeline: EventTimeline = EventTimeline()
-    ) {
+) {
     /**
      * An explicit tag for when this packet was originally received (assuming it
      * was an incoming packet and not one created by jvb itself).
      */
     var receivedTime: Long = -1L
+
+    /**
+     * Whether this packet has been recognized to contain only shouldDiscard.
+     */
+    var shouldDiscard: Boolean = false
+
+    /**
+     * The ID of the endpoint associated with this packet (i.e. the source endpoint).
+     */
+    var endpointId: String? = null
+
+    /**
+     * The payload verification string for the packet, or 'null' if payload verification is disabled. Calculating the
+     * it is expensive, thus we only do it when the flag is enabled.
+     */
+    var payloadVerification = if (ENABLE_PAYLOAD_VERIFICATION) packet.payloadVerification else null
+
+    /**
+     * Re-calculates the expected payload verification string. This should be called any time that the code
+     * intentionally modifies the packet in a way that could change the verification string (for example, re-creates
+     * it with a new type (parsing), or intentionally modifies the payload (SRTP)).
+     */
+    fun resetPayloadVerification() {
+        payloadVerification = if (ENABLE_PAYLOAD_VERIFICATION) packet.payloadVerification else null
+    }
+
     /**
      * Get the contained packet cast to [ExpectedPacketType]
      */
     @Suppress("UNCHECKED_CAST")
-    fun <ExpectedPacketType>packetAs(): ExpectedPacketType {
+    fun <ExpectedPacketType : Packet> packetAs(): ExpectedPacketType {
         return packet as ExpectedPacketType
     }
 
@@ -93,12 +127,71 @@ class PacketInfo @JvmOverloads constructor(
      * will be copied for the cloned PacketInfo).
      */
     fun clone(): PacketInfo {
-        val clone = PacketInfo(packet.clone(), timeline.clone())
+        val clone = if (ENABLE_TIMELINE) {
+            PacketInfo(packet.clone(), timeline.clone())
+        } else {
+            // If the timeline isn't enabled, we can just share the same one.
+            // (This would change if we allowed enabling the timeline at runtime)
+            PacketInfo(packet.clone(), timeline)
+        }
         clone.receivedTime = receivedTime
+        clone.payloadVerification = payloadVerification
+        @Suppress("UNCHECKED_CAST") /* ArrayList.clone() really does return ArrayList, not Object. */
+        clone.onSentActions = onSentActions?.clone() as ArrayList<()->Unit>?
         return clone
     }
 
-    fun addEvent(desc: String) = timeline.addEvent(desc)
+    fun addEvent(desc: String) {
+        if (ENABLE_TIMELINE) {
+            timeline.addEvent(desc)
+        }
+    }
+
+    /**
+     * The list of pending actions, or [null] if none.
+     */
+    private var onSentActions: ArrayList<() -> Unit>? = null
+
+    /**
+     * Add an action to be performed when the packet is sent (i.e. when this packet's
+     * [sent] method is called).
+     *
+     * If this [PacketInfo] object is cloned, the action will be called for every
+     * cloned instance.  If packet is dropped (i.e. [sent] is never called), the
+     * action will not be called.
+     */
+    fun onSent(action: () -> Unit) {
+        synchronized(this) {
+            if (onSentActions == null) {
+                onSentActions = ArrayList(1)
+            }
+            onSentActions!!.add(action)
+        }
+    }
+
+    /**
+     * Invoke any actions previously registered with this [PacketInfo]'s [onSent]
+     * method.  This should be called just before, or after, this packet is sent.
+     */
+    fun sent() {
+        var actions: List<() -> Unit> = Collections.emptyList()
+        synchronized(this) {
+            onSentActions?.let { actions = it; onSentActions = null } ?: run { return@sent }
+        }
+        for (action in actions) {
+            action.invoke()
+        }
+    }
+
+    companion object {
+        // TODO: we could make this a public var to allow changing this at runtime
+        private const val ENABLE_TIMELINE = false
+
+        /**
+         * If this is enabled all [Node]s will verify that the payload didn't unexpectedly change. This is expensive.
+         */
+        var ENABLE_PAYLOAD_VERIFICATION = false
+    }
 }
 
 /**
@@ -110,5 +203,5 @@ class PacketInfo @JvmOverloads constructor(
  */
 @Suppress("UNCHECKED_CAST")
 inline fun <ExpectedPacketType> Iterable<PacketInfo>.forEachAs(action: (PacketInfo, ExpectedPacketType) -> Unit) {
-    for (element in this) action (element, element.packet as ExpectedPacketType)
+    for (element in this) action(element, element.packet as ExpectedPacketType)
 }

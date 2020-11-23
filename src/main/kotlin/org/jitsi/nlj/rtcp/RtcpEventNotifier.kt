@@ -16,15 +16,14 @@
 
 package org.jitsi.nlj.rtcp
 
-import org.jitsi.nlj.PacketInfo
-import org.jitsi.rtp.rtcp.RtcpPacket
 import java.util.concurrent.CopyOnWriteArrayList
+import org.jitsi.rtp.rtcp.RtcpPacket
 
 /**
- * A central place to allow the publishing of when RTCP packets are recieved or sent.  We're
+ * A central place to allow the publishing of when RTCP packets are received or sent.  We're
  * interested in both of these scenarios for things like SRs, RRs and for RTT calculations
  */
-//TODO(brian): maybe post the notifcations to another pool, so we don't hold up the caller?
+// TODO(brian): maybe post the notifications to another pool, so we don't hold up the caller?
 class RtcpEventNotifier {
     private val rtcpListeners: MutableList<RtcpListener> = CopyOnWriteArrayList<RtcpListener>()
 
@@ -32,11 +31,11 @@ class RtcpEventNotifier {
         rtcpListeners.add(listener)
     }
 
-    fun notifyRtcpReceived(packetInfo: PacketInfo) {
-        rtcpListeners.forEach { it.onRtcpPacketReceived(packetInfo) }
+    fun notifyRtcpReceived(packet: RtcpPacket, receivedTime: Long) {
+        rtcpListeners.forEach { it.rtcpPacketReceived(packet, receivedTime) }
     }
 
     fun notifyRtcpSent(rtcpPacket: RtcpPacket) {
-        rtcpListeners.forEach { it.onRtcpPacketSent(rtcpPacket) }
+        rtcpListeners.forEach { it.rtcpPacketSent(rtcpPacket) }
     }
 }

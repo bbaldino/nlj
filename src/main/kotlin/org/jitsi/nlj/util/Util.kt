@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,15 +15,15 @@
  */
 package org.jitsi.nlj.util
 
-import java.math.BigDecimal
 import java.time.Duration
+import java.util.function.Predicate
+import org.jitsi.rtp.Packet
 
 class Util {
     companion object {
-        fun getMbps(numBytes: Long, duration: Duration): String {
-            val numBits = BigDecimal(numBytes * 8)
-            val megaBits = (numBits / BigDecimal(1000000.0)).toFloat()
-            return "%.2f".format((megaBits / duration.toMillis()) * Duration.ofSeconds(1).toMillis())
+        fun getMbps(numBytes: Number, duration: Duration): Double {
+            val mbps = (numBytes.toLong() * 8.0) / (duration.toMillis() * 1000)
+            return if (mbps == Double.NaN) -1.0 else mbps
         }
     }
 }
@@ -43,10 +43,17 @@ inline fun <reified Expected> Iterable<*>.forEachIf(action: (Expected) -> Unit) 
     }
 }
 
-inline fun getStackTrace(): String = with (StringBuffer()) {
+infix fun Int.floorMod(other: Int): Int {
+    return Math.floorMod(this, other)
+}
+
+/* We inline this so getStackTrace itself doesn't show up in the stack trace. */
+@Suppress("NOTHING_TO_INLINE")
+inline fun getStackTrace(): String = with(StringBuffer()) {
     for (ste in Thread.currentThread().stackTrace) {
         appendln(ste.toString())
     }
     toString()
 }
 
+typealias PacketPredicate = Predicate<Packet>

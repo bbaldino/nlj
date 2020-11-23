@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,33 +15,40 @@
  */
 package org.jitsi.nlj.rtp
 
-import org.jitsi.impl.neomedia.rtp.FrameDesc
-import org.jitsi.impl.neomedia.rtp.RTPEncodingDesc
-import org.jitsi.rtp.Packet
-import org.jitsi.rtp.RtpHeader
-import org.jitsi.rtp.RtpPacket
-import org.jitsi.rtp.extensions.clone
-import java.nio.ByteBuffer
+import org.jitsi.rtp.rtp.RtpPacket
 
-class VideoRtpPacket : RtpPacket {
-    var isKeyFrame: Boolean = false
-    var frameDesc: FrameDesc? = null
-    var trackEncodings: Array<RTPEncodingDesc>? = null
-//    var rtpEncodingDesc: RTPEncodingDesc? = null
-
-    constructor(buf: ByteBuffer) : super(buf)
+/**
+ * A packet which we know contains video, but we've not yet
+ * parsed (i.e. we don't know information gained from
+ * parsing codec-specific data).
+ */
+open class VideoRtpPacket protected constructor(
+    buffer: ByteArray,
+    offset: Int,
+    length: Int,
+    qualityIndex: Int?
+) : RtpPacket(buffer, offset, length) {
 
     constructor(
-        header: RtpHeader = RtpHeader(),
-        payload: ByteBuffer = ByteBuffer.allocate(0)
-    ) : super(header, payload)
+        buffer: ByteArray,
+        offset: Int,
+        length: Int
+    ) : this(
+        buffer, offset, length,
+        qualityIndex = null
+    )
 
-    override fun clone(): Packet {
-        val clone = VideoRtpPacket(getBuffer().clone())
-        clone.isKeyFrame = isKeyFrame
-        clone.frameDesc = frameDesc
-        clone.trackEncodings = trackEncodings
+    /** The index of this packet relative to its source's RtpLayers. */
+    var qualityIndex: Int = qualityIndex ?: -1
 
-        return clone
+    open val layerId = 0
+
+    override fun clone(): VideoRtpPacket {
+        return VideoRtpPacket(
+            cloneBuffer(BYTES_TO_LEAVE_AT_START_OF_PACKET),
+            BYTES_TO_LEAVE_AT_START_OF_PACKET,
+            length,
+            qualityIndex = qualityIndex
+        )
     }
 }

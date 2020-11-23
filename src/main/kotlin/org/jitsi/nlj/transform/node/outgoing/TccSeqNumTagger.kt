@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,47 +15,68 @@
  */
 package org.jitsi.nlj.transform.node.outgoing
 
-import org.jitsi.nlj.Event
 import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.RtpExtensionAddedEvent
-import org.jitsi.nlj.RtpExtensionClearEvent
-import org.jitsi.nlj.forEachAs
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.nlj.util.toRawPacket
-import org.jitsi.rtp.RtpPacket
-import org.jitsi.rtp.TccHeaderExtension
-import org.jitsi.service.neomedia.RTPExtension
-import org.jitsi_modified.impl.neomedia.rtp.TransportCCEngine
-import unsigned.toUInt
+import org.jitsi.nlj.rtp.RtpExtensionType.TRANSPORT_CC
+import org.jitsi.nlj.rtp.TransportCcEngine
+import org.jitsi.nlj.rtp.VideoRtpPacket
+import org.jitsi.nlj.stats.NodeStatsBlock
+import org.jitsi.nlj.transform.node.ModifierNode
+import org.jitsi.nlj.util.ReadOnlyStreamInformationStore
+import org.jitsi.nlj.util.bytes
+import org.jitsi.rtp.rtp.RtpPacket
+import org.jitsi.rtp.rtp.header_extensions.TccHeaderExtension
+import java.lang.ref.WeakReference
 
 class TccSeqNumTagger(
-    private val transportCcEngine: TransportCCEngine? = null
-) : Node("TCC sequence number tagger") {
+    transportCcEngine: TransportCcEngine? = null,
+    streamInformationStore: ReadOnlyStreamInformationStore
+) : ModifierNode("TCC sequence number tagger") {
     private var currTccSeqNum: Int = 1
     private var tccExtensionId: Int? = null
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        p.forEachAs<RtpPacket> { _, pkt ->
-            tccExtensionId?.let { tccExtId ->
-                val ext = TccHeaderExtension(tccExtId, currTccSeqNum++)
-                pkt.header.addExtension(tccExtId, ext)
-            }
+    init {
+        streamInformationStore.onRtpExtensionMapping(TRANSPORT_CC) {
+            tccExtensionId = it
         }
-        transportCcEngine?.egressEngine?.rtpTransformer?.transform(p.map { it.packet.toRawPacket() }.toTypedArray())
-        next(p)
     }
 
-    override fun handleEvent(event: Event) {
-        when (event) {
-            is RtpExtensionAddedEvent -> {
-                if (RTPExtension.TRANSPORT_CC_URN.equals(event.rtpExtension.uri.toString())) {
-                    tccExtensionId = event.extensionId.toUInt()
-                    logger.cinfo { "TCC seq num tagger setting extension ID to $tccExtensionId" }
+    private val weakTcc = WeakReference(transportCcEngine)
+
+    override fun modify(packetInfo: PacketInfo): PacketInfo {
+        tccExtensionId?.let { tccExtId ->
+            when (val rtpPacket = packetInfo.packetAs<RtpPacket>()) {
+                is VideoRtpPacket -> {
+                    val ext = rtpPacket.getHeaderExtension(tccExtId)
+                        ?: rtpPacket.addHeaderExtension(tccExtId, TccHeaderExtension.DATA_SIZE_BYTES)
+
+                    TccHeaderExtension.setSequenceNumber(ext, currTccSeqNum)
+
+                    val curSeq = currTccSeqNum
+                    val len = rtpPacket.length.bytes
+                    packetInfo.onSent { weakTcc.get()?.mediaPacketSent(curSeq, len) }
+
+                    currTccSeqNum++
+                }
+                else -> {
+                    rtpPacket.getHeaderExtension(tccExtId)?.let {
+                        // This is a hack: we don't want to do TCC for audio (since some browsers
+                        // don't support it) but we don't want to strip the existing extension
+                        // either (as its costly), so we merely change its ID to something we
+                        // know (based on Jicofo's offer) is unused.
+                        it.id = 14
+                    }
                 }
             }
-            is RtpExtensionClearEvent -> tccExtensionId = null
+        }
+
+        return packetInfo
+    }
+
+    override fun getNodeStats(): NodeStatsBlock {
+        return super.getNodeStats().apply {
+            addString("tcc_ext_id", tccExtensionId.toString())
         }
     }
 
+    override fun trace(f: () -> Unit) = f.invoke()
 }

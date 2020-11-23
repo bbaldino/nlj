@@ -16,7 +16,47 @@
 
 package org.jitsi.nlj.stats
 
+import org.jitsi.nlj.util.NEVER
+import org.jitsi.nlj.util.latest
+import org.jitsi.nlj.util.threadSafeVetoable
+import java.time.Instant
+
+@Suppress("unused")
 class PacketIOActivity {
-    var lastPacketReceivedTimestampMs: Long = 0
-    var lastPacketSentTimestampMs: Long = 0
+    /**
+     * The last time an RTP or RTCP packet was received.
+     */
+    var lastRtpPacketReceivedInstant: Instant by threadSafeVetoable(NEVER) { _, oldValue, newValue ->
+        newValue.isAfter(oldValue)
+    }
+    /**
+     * The last time an RTP or RTCP packet was received.
+     */
+    var lastRtpPacketSentInstant: Instant by threadSafeVetoable(NEVER) { _, oldValue, newValue ->
+        newValue.isAfter(oldValue)
+    }
+    /**
+     * The last time ICE consent was refreshed.
+     */
+    var lastIceActivityInstant: Instant by threadSafeVetoable(NEVER) { _, oldValue, newValue ->
+        newValue.isAfter(oldValue)
+    }
+
+    /**
+     * The last time an RTP or RTCP packet was sent or received.
+     */
+    val lastRtpActivityInstant: Instant
+        get() = latest(lastRtpPacketReceivedInstant, lastRtpPacketSentInstant)
+
+    /**
+     * The last time a packet was received (RTP, RTCP or ICE consent).
+     */
+    val lastIncomingActivityInstant: Instant
+        get() = latest(lastRtpPacketReceivedInstant, lastIceActivityInstant)
+
+    /**
+     * The last time a packet was sent or received.
+     */
+    val lastActivityInstant: Instant
+        get() = latest(lastRtpPacketReceivedInstant, lastRtpPacketSentInstant, lastIceActivityInstant)
 }

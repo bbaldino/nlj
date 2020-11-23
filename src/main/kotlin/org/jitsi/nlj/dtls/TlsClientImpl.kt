@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,69 +15,90 @@
  */
 package org.jitsi.nlj.dtls
 
-import org.bouncycastle.crypto.tls.Certificate
-import org.bouncycastle.crypto.tls.CertificateRequest
-import org.bouncycastle.crypto.tls.DefaultTlsClient
-import org.bouncycastle.crypto.tls.DefaultTlsSignerCredentials
-import org.bouncycastle.crypto.tls.HashAlgorithm
-import org.bouncycastle.crypto.tls.ProtocolVersion
-import org.bouncycastle.crypto.tls.SRTPProtectionProfile
-import org.bouncycastle.crypto.tls.SignatureAlgorithm
-import org.bouncycastle.crypto.tls.SignatureAndHashAlgorithm
-import org.bouncycastle.crypto.tls.TlsAuthentication
-import org.bouncycastle.crypto.tls.TlsContext
-import org.bouncycastle.crypto.tls.TlsCredentials
-import org.bouncycastle.crypto.tls.TlsSRTPUtils
-import org.bouncycastle.crypto.tls.TlsUtils
-import org.bouncycastle.crypto.tls.UseSRTPData
-import java.util.*
+import java.nio.ByteBuffer
+import java.util.Hashtable
+import org.bouncycastle.crypto.util.PrivateKeyFactory
+import org.bouncycastle.tls.Certificate
+import org.bouncycastle.tls.CertificateRequest
+import org.bouncycastle.tls.CipherSuite
+import org.bouncycastle.tls.DefaultTlsClient
+import org.bouncycastle.tls.ExporterLabel
+import org.bouncycastle.tls.ExtensionType
+import org.bouncycastle.tls.HashAlgorithm
+import org.bouncycastle.tls.ProtocolVersion
+import org.bouncycastle.tls.SignatureAlgorithm
+import org.bouncycastle.tls.SignatureAndHashAlgorithm
+import org.bouncycastle.tls.TlsAuthentication
+import org.bouncycastle.tls.TlsCredentials
+import org.bouncycastle.tls.TlsSRTPUtils
+import org.bouncycastle.tls.TlsServerCertificate
+import org.bouncycastle.tls.TlsSession
+import org.bouncycastle.tls.TlsUtils
+import org.bouncycastle.tls.UseSRTPData
+import org.bouncycastle.tls.crypto.TlsCryptoParameters
+import org.bouncycastle.tls.crypto.impl.bc.BcDefaultTlsCredentialedSigner
+import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto
+import org.jitsi.nlj.srtp.SrtpConfig
+import org.jitsi.nlj.srtp.SrtpUtil
+import org.jitsi.utils.logging2.cdebug
+import org.jitsi.utils.logging2.cinfo
+import org.jitsi.utils.logging2.createChildLogger
+import org.jitsi.rtp.extensions.toHex
+import org.jitsi.utils.logging2.Logger
 
 /**
  * Implementation of [DefaultTlsClient].
  */
-class TlsClientImpl : DefaultTlsClient() {
-    private var clientCredentials: TlsCredentials? = null
+class TlsClientImpl(
+    private val certificateInfo: CertificateInfo,
     /**
-     * The SRTP Master Key Identifier (MKI) used by the
-     * <tt>SRTPCryptoContext</tt> associated with this instance. Since the
-     * <tt>SRTPCryptoContext</tt> class does not utilize it, the value is
-     * {@link TlsUtils#EMPTY_BYTES}.
+     * The function to call when the server certificateInfo is available.
      */
-    private val mki = TlsUtils.EMPTY_BYTES
-    private val srtpProtectionProfiles = intArrayOf(
-        SRTPProtectionProfile.SRTP_AES128_CM_HMAC_SHA1_80,
-        SRTPProtectionProfile.SRTP_AES128_CM_HMAC_SHA1_32
-    )
+    private val notifyServerCertificate: (Certificate?) -> Unit,
+    parentLogger: Logger
+) : DefaultTlsClient(BC_TLS_CRYPTO) {
+
+    private val logger = createChildLogger(parentLogger)
+
+    private val config = DtlsConfig()
+
+    private var session: TlsSession? = null
+
+    private var clientCredentials: TlsCredentials? = null
+
+    /**
+     * Only set after a handshake has completed
+     */
+    lateinit var srtpKeyingMaterial: ByteArray
+
     var chosenSrtpProtectionProfile: Int = 0
 
-    fun getContext(): TlsContext = context
+    override fun getSessionToResume(): TlsSession? = session
 
     override fun getAuthentication(): TlsAuthentication {
         return object : TlsAuthentication {
             override fun getClientCredentials(certificateRequest: CertificateRequest): TlsCredentials {
-                // TODO: Do this via some sort of observer instead? Does this need to be updated it if survives across
-                // a certificate expiration?
-                // NOTE: can't just assign this outright because 'context' won't be set yet
+                // NOTE: can't set clientCredentials when it is declared because 'context' won't be set yet
                 if (clientCredentials == null) {
-                    val certificateInfo = DtlsStack.getCertificate()
-                    clientCredentials = DefaultTlsSignerCredentials(
-                        context,
+                    clientCredentials = BcDefaultTlsCredentialedSigner(
+                        TlsCryptoParameters(context),
+                        (context.crypto as BcTlsCrypto),
+                        PrivateKeyFactory.createKey(certificateInfo.keyPair.private.encoded),
                         certificateInfo.certificate,
-                        certificateInfo.keyPair.private,
-                        SignatureAndHashAlgorithm(HashAlgorithm.sha1, SignatureAlgorithm.rsa)
+                        SignatureAndHashAlgorithm(HashAlgorithm.sha256, SignatureAlgorithm.ecdsa)
                     )
                 }
                 return clientCredentials!!
             }
 
-            override fun notifyServerCertificate(certificate: Certificate) {
-                // TODO: Need access to the remote fingerprints here to verify
+            override fun notifyServerCertificate(serverCertificate: TlsServerCertificate) {
+                this@TlsClientImpl.notifyServerCertificate(serverCertificate.certificate)
             }
         }
     }
 
     override fun getClientExtensions(): Hashtable<*, *> {
-        var clientExtensions = super.getClientExtensions();
+        var clientExtensions = super.getClientExtensions()
         if (TlsSRTPUtils.getUseSRTPExtension(clientExtensions) == null) {
             if (clientExtensions == null) {
                 clientExtensions = Hashtable<Int, ByteArray>()
@@ -85,52 +106,71 @@ class TlsClientImpl : DefaultTlsClient() {
 
             TlsSRTPUtils.addUseSRTPExtension(
                 clientExtensions,
-                UseSRTPData(srtpProtectionProfiles, mki)
+                UseSRTPData(SrtpConfig.protectionProfiles.toIntArray(), TlsUtils.EMPTY_BYTES)
             )
         }
+        clientExtensions.put(ExtensionType.renegotiation_info, byteArrayOf(0))
 
         return clientExtensions
     }
 
     override fun processServerExtensions(serverExtensions: Hashtable<*, *>?) {
-        //TODO: a few cases we should be throwing alerts for in here.  see old TlsClientImpl
-        val useSRTPData = TlsSRTPUtils.getUseSRTPExtension(serverExtensions);
-        val protectionProfiles = useSRTPData.protectionProfiles;
-        chosenSrtpProtectionProfile = when (protectionProfiles.size) {
-            1 -> DtlsUtils.chooseSrtpProtectionProfile(srtpProtectionProfiles, protectionProfiles)
-            else -> 0
-        }
-        if (chosenSrtpProtectionProfile == 0) {
-            // throw alert
-        }
+        // TODO: a few cases we should be throwing alerts for in here.  see old TlsClientImpl
+        val useSRTPData = TlsSRTPUtils.getUseSRTPExtension(serverExtensions)
+        val protectionProfiles = useSRTPData.protectionProfiles
+        chosenSrtpProtectionProfile =
+            DtlsUtils.chooseSrtpProtectionProfile(SrtpConfig.protectionProfiles, protectionProfiles.asIterable())
     }
+
+    override fun getCipherSuites(): IntArray {
+        return intArrayOf(
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
+        )
+    }
+
+    override fun getHandshakeTimeoutMillis(): Int = config.handshakeTimeout.toMillis().toInt()
 
     override fun notifyHandshakeComplete() {
-        //TODO: as of (at least) v 1.60 of BC, extracting the key information
-        // after dtlisclientprotocol.connect finishes will not work, as the
-        // connect method clears the security parameters at the end.  according to the
-        // gh link below, this method is the hook that should be used to export the keying material
-        // in later versions (also, the tls.crypto api is deprecated and we should move off of that)
-        // https://github.com/bcgit/bc-java/issues/203
-        // "The intention is that you call exportKeyingMaterial during the notifyHandshakeComplete
-        // callback on your TlsClient subclass"
-        //context.exportKeyingMaterial()
-    }
+        super.notifyHandshakeComplete()
+        context.resumableSession?.let { newSession ->
 
-    override fun getClientVersion(): ProtocolVersion = ProtocolVersion.DTLSv10;
-
-    override fun getMinimumVersion(): ProtocolVersion = ProtocolVersion.DTLSv10;
-
-    override fun notifyAlertRaised(alertLevel: Short, alertDescription: Short, message: String?, cause: Throwable?) {
-        val stack = with(StringBuffer()) {
-            val e = Exception()
-            for (el in e.stackTrace) {
-                appendln(el.toString())
+            session?.let { existingSession ->
+                if (existingSession.sessionID?.contentEquals(newSession.sessionID) == true) {
+                    logger.cdebug {
+                        val newSessionIdHex = ByteBuffer.wrap(newSession.sessionID).toHex()
+                        "Resumed DTLS session $newSessionIdHex"
+                    }
+                }
+            } ?: run {
+                logger.cdebug {
+                    val newSessionIdHex = ByteBuffer.wrap(newSession.sessionID).toHex()
+                    "Established DTLS session $newSessionIdHex"
+                }
+                this.session = newSession
             }
-            toString()
         }
+        val srtpProfileInformation =
+            SrtpUtil.getSrtpProfileInformationFromSrtpProtectionProfile(chosenSrtpProtectionProfile)
+        srtpKeyingMaterial = context.exportKeyingMaterial(
+            ExporterLabel.dtls_srtp,
+            null,
+            2 * (srtpProfileInformation.cipherKeyLength + srtpProfileInformation.cipherSaltLength)
+        )
     }
 
-    override fun notifyAlertReceived(alertLevel: Short, alertDescription: Short) {
+    override fun notifyServerVersion(serverVersion: ProtocolVersion?) {
+        super.notifyServerVersion(serverVersion)
+
+        logger.cinfo { "Negotiated DTLS version $serverVersion" }
     }
+
+    override fun getSupportedVersions(): Array<ProtocolVersion> =
+        ProtocolVersion.DTLSv12.downTo(ProtocolVersion.DTLSv10)
+
+    override fun notifyAlertRaised(alertLevel: Short, alertDescription: Short, message: String?, cause: Throwable?) =
+        logger.notifyAlertRaised(alertLevel, alertDescription, message, cause)
+
+    override fun notifyAlertReceived(alertLevel: Short, alertDescription: Short) =
+        logger.notifyAlertReceived(alertLevel, alertDescription)
 }

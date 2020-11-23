@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,230 +15,293 @@
  */
 package org.jitsi.nlj
 
-import org.jitsi.impl.neomedia.transform.SinglePacketTransformer
-import org.jitsi.nlj.rtcp.NackHandler
-import org.jitsi.nlj.rtcp.RtcpEventNotifier
-import org.jitsi.nlj.rtcp.RtcpSrGenerator
-import org.jitsi.nlj.stats.NodeStatsBlock
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.transform.node.NodeEventVisitor
-import org.jitsi.nlj.transform.node.NodeStatsVisitor
-import org.jitsi.nlj.transform.node.PacketCache
-import org.jitsi.nlj.transform.node.outgoing.AbsSendTime
-import org.jitsi.nlj.transform.node.outgoing.OutgoingStatisticsTracker
-import org.jitsi.nlj.transform.node.outgoing.OutgoingStreamStatistics
-import org.jitsi.nlj.transform.node.outgoing.RetransmissionSender
-import org.jitsi.nlj.transform.node.outgoing.SentRtcpStats
-import org.jitsi.nlj.transform.node.outgoing.SrtcpTransformerEncryptNode
-import org.jitsi.nlj.transform.node.outgoing.SrtpTransformerEncryptNode
-import org.jitsi.nlj.transform.node.outgoing.TccSeqNumTagger
-import org.jitsi.nlj.transform.pipeline
-import org.jitsi.nlj.util.Util.Companion.getMbps
-import org.jitsi.nlj.util.cerror
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.nlj.util.getLogger
-import org.jitsi.rtp.RtpPacket
-import org.jitsi.rtp.rtcp.RtcpPacket
-import org.jitsi_modified.impl.neomedia.rtp.TransportCCEngine
+import org.jitsi.config.JitsiConfig
+import org.jitsi.metaconfig.config
+import org.jitsi.metaconfig.from
 import java.time.Duration
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
+import org.jitsi.nlj.rtcp.KeyframeRequester
+import org.jitsi.nlj.rtcp.NackHandler
+import org.jitsi.nlj.rtcp.RtcpEventNotifier
+import org.jitsi.nlj.rtcp.RtcpSrUpdater
+import org.jitsi.nlj.rtp.TransportCcEngine
+import org.jitsi.nlj.rtp.bandwidthestimation.BandwidthEstimator
+import org.jitsi.nlj.rtp.bandwidthestimation.GoogleCcEstimator
+import org.jitsi.nlj.srtp.SrtpTransformers
+import org.jitsi.nlj.stats.NodeStatsBlock
+import org.jitsi.nlj.transform.NodeEventVisitor
+import org.jitsi.nlj.transform.NodeStatsVisitor
+import org.jitsi.nlj.transform.NodeTeardownVisitor
+import org.jitsi.nlj.transform.node.AudioRedHandler
+import org.jitsi.nlj.transform.node.ConsumerNode
+import org.jitsi.nlj.transform.node.Node
+import org.jitsi.nlj.transform.node.PacketCacher
+import org.jitsi.nlj.transform.node.PacketLossConfig
+import org.jitsi.nlj.transform.node.PacketLossNode
+import org.jitsi.nlj.transform.node.PacketStreamStatsNode
+import org.jitsi.nlj.transform.node.SrtcpEncryptNode
+import org.jitsi.nlj.transform.node.SrtpEncryptNode
+import org.jitsi.nlj.transform.node.ToggleablePcapWriter
+import org.jitsi.nlj.transform.node.outgoing.AbsSendTime
+import org.jitsi.nlj.transform.node.outgoing.OutgoingStatisticsTracker
+import org.jitsi.nlj.transform.node.outgoing.ProbingDataSender
+import org.jitsi.nlj.transform.node.outgoing.RetransmissionSender
+import org.jitsi.nlj.transform.node.outgoing.SentRtcpStats
+import org.jitsi.nlj.transform.node.outgoing.TccSeqNumTagger
+import org.jitsi.nlj.transform.pipeline
+import org.jitsi.nlj.util.PacketInfoQueue
+import org.jitsi.nlj.util.StreamInformationStore
+import org.jitsi.utils.logging2.cdebug
+import org.jitsi.utils.logging2.createChildLogger
+import org.jitsi.rtp.rtcp.RtcpPacket
+import org.jitsi.utils.MediaType
+import org.jitsi.utils.logging.DiagnosticContext
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.queue.CountingErrorHandler
+
+import org.jitsi.nlj.util.BufferPool
 
 class RtpSenderImpl(
-        val id: String,
-        transportCcEngine: TransportCCEngine? = null,
-        private val rtcpEventNotifier: RtcpEventNotifier,
-        /**
-         * The executor this class will use for its primary work (i.e. critical path
-         * packet processing).  This [RtpSender] will execute a blocking queue read
-         * on this executor.
-         */
-        val executor: ExecutorService,
-        /**
-         * A [ScheduledExecutorService] which can be used for less important
-         * background tasks, or tasks that need to execute at some fixed delay/rate
-         */
-        val backgroundExecutor: ScheduledExecutorService
+    val id: String,
+    private val rtcpEventNotifier: RtcpEventNotifier,
+    /**
+     * The executor this class will use for its primary work (i.e. critical path
+     * packet processing).  This [RtpSender] will execute a blocking queue read
+     * on this executor.
+     */
+    val executor: ExecutorService,
+    /**
+     * A [ScheduledExecutorService] which can be used for less important
+     * background tasks, or tasks that need to execute at some fixed delay/rate
+     */
+    val backgroundExecutor: ScheduledExecutorService,
+    private val streamInformationStore: StreamInformationStore,
+    parentLogger: Logger,
+    diagnosticContext: DiagnosticContext = DiagnosticContext()
 ) : RtpSender() {
-    protected val logger = getLogger(this.javaClass)
+    private val logger = createChildLogger(parentLogger)
     private val outgoingRtpRoot: Node
     private val outgoingRtxRoot: Node
     private val outgoingRtcpRoot: Node
-    val incomingPacketQueue = LinkedBlockingQueue<PacketInfo>()
-    var numIncomingBytes: Long = 0
-    var firstPacketWrittenTime = -1L
-    var lastPacketWrittenTime = -1L
-    var running = true
-
-    private var firstQueueReadTime: Long = -1
-    private var lastQueueReadTime: Long = -1
-    private var numQueueReads: Long = 0
-    private var numTimesQueueEmpty: Long = 0
-
-    private val srtpEncryptWrapper = SrtpTransformerEncryptNode()
-    private val srtcpEncryptWrapper = SrtcpTransformerEncryptNode()
-    private val outgoingPacketCache = PacketCache()
-    private val absSendTime = AbsSendTime()
-    private val statTracker = OutgoingStatisticsTracker()
-    /**
-     * The SR generator runs on its own in the background.  It will access the outgoing stats via the given
-     * [OutgoingStatisticsTracker] to grab a snapshot of the current state for filling out an SR and sending it
-     * via the given RTCP sender.
-     */
-    private val rtcpSrGenerator = RtcpSrGenerator(
-            backgroundExecutor,
-            { rtcpPacket -> sendRtcp(listOf(rtcpPacket)) },
-            statTracker
+    private val queueSize: Int by config("jmt.transceiver.send.queue-size".from(JitsiConfig.newConfig))
+    private val incomingPacketQueue = PacketInfoQueue(
+        "rtp-sender-incoming-packet-queue",
+        executor,
+        this::handlePacket,
+        queueSize
     )
+    var running = true
+    private var localVideoSsrc: Long? = null
+    private var localAudioSsrc: Long? = null
+    // TODO(brian): this is changed to a handler instead of a queue because we want to use
+    // a PacketQueue, and the handler for a PacketQueue must be set at the time of creation.
+    // since we want the handler to be another entity (something in jvb) we just use
+    // a generic handler here and then the bridge can put it into its PacketQueue and have
+    // its handler (likely in another thread) grab the packet and send it out
+    private var outgoingPacketHandler: PacketHandler? = null
+    override val bandwidthEstimator: BandwidthEstimator = GoogleCcEstimator(diagnosticContext, logger)
+    private val transportCcEngine = TransportCcEngine(bandwidthEstimator, logger)
+
+    private val srtpEncryptWrapper = SrtpEncryptNode()
+    private val srtcpEncryptWrapper = SrtcpEncryptNode()
+    private val toggleablePcapWriter = ToggleablePcapWriter(logger, "$id-tx")
+    private val outgoingPacketCache = PacketCacher()
+    private val absSendTime = AbsSendTime(streamInformationStore)
+    private val statsTracker = OutgoingStatisticsTracker()
+    private val packetStreamStats = PacketStreamStatsNode()
+    private val rtcpSrUpdater = RtcpSrUpdater(statsTracker)
+    private val keyframeRequester = KeyframeRequester(streamInformationStore, logger)
+    private val probingDataSender: ProbingDataSender
+
     private val nackHandler: NackHandler
 
-    private val outputPipelineTerminationNode = object : Node("Output pipeline termination node") {
-        override fun doProcessPackets(p: List<PacketInfo>) {
-            p.forEach {
-                if (it.timeline.totalDelay() > Duration.ofMillis(100)) {
-                    logger.cerror { "Packet took >100ms to get through bridge:\n${it.timeline}"}
-                }
-            }
-            this@RtpSenderImpl.packetSender.processPackets(p)
+    private val outputPipelineTerminationNode = object : ConsumerNode("Output pipeline termination node") {
+        override fun consume(packetInfo: PacketInfo) {
+            // While there's no handler set we're effectively dropping packets, so their buffers
+            // should be returned.
+            outgoingPacketHandler?.processPacket(packetInfo) ?: packetDiscarded(packetInfo)
         }
-    }
 
-    private var tempSenderSsrc: Long? = null
+        override val aggregationKey = name
 
-    companion object {
-        private const val PACKET_QUEUE_ENTRY_EVENT = "Entered RTP sender incoming queue"
-        private const val PACKET_QUEUE_EXIT_EVENT = "Exited RTP sender incoming queue"
+        override fun trace(f: () -> Unit) = f.invoke()
     }
 
     init {
-        logger.cinfo { "Sender $id using executor ${executor.hashCode()}" }
+        logger.cdebug { "Sender $id using executor ${executor.hashCode()}" }
+
+        if (packetLossConfig.enabled) {
+            logger.warn("Will simulate packet loss: $packetLossConfig")
+        }
+
+        incomingPacketQueue.setErrorHandler(queueErrorCounter)
 
         outgoingRtpRoot = pipeline {
-            simpleNode("TEMP sender ssrc setter") { pktInfos ->
-                if (tempSenderSsrc == null && pktInfos.isNotEmpty()) {
-                    val pktInfo = pktInfos[0]
-                    if (pktInfo.packet is RtpPacket) {
-                        tempSenderSsrc = (pktInfo.packet as? RtpPacket)?.header?.ssrc
-                        logger.cinfo { "RtpSenderImpl $id setting sender ssrc to $tempSenderSsrc" }
-                    }
-                }
-                pktInfos
-            }
+            node(AudioRedHandler(streamInformationStore))
             node(outgoingPacketCache)
             node(absSendTime)
-            node(statTracker)
-            node(TccSeqNumTagger(transportCcEngine))
+            node(statsTracker)
+            node(TccSeqNumTagger(transportCcEngine, streamInformationStore))
+            node(toggleablePcapWriter.newObserverNode())
             node(srtpEncryptWrapper)
+            node(packetStreamStats.createNewNode())
+            node(PacketLossNode(packetLossConfig), condition = { packetLossConfig.enabled })
             node(outputPipelineTerminationNode)
         }
 
         outgoingRtxRoot = pipeline {
-            node(RetransmissionSender())
+            node(RetransmissionSender(streamInformationStore, logger))
             // We want RTX packets to hook into the main RTP pipeline starting at AbsSendTime
             node(absSendTime)
         }
 
-        nackHandler = NackHandler(outgoingPacketCache.getPacketCache(), outgoingRtxRoot)
+        nackHandler = NackHandler(outgoingPacketCache.getPacketCache(), outgoingRtxRoot, logger)
         rtcpEventNotifier.addRtcpEventListener(nackHandler)
+        rtcpEventNotifier.addRtcpEventListener(transportCcEngine)
 
-        //TODO: aggregate/translate PLI/FIR/etc in the egress RTCP pipeline
+        // TODO: are we setting outgoing rtcp sequence numbers correctly? just add a simple node here to rewrite them
         outgoingRtcpRoot = pipeline {
+            node(keyframeRequester)
             node(SentRtcpStats())
-            simpleNode("RTCP sender ssrc setter") { pktInfos ->
-                tempSenderSsrc?.let { senderSsrc ->
-                    pktInfos.forEachAs<RtcpPacket> { _, pkt ->
-                        //TODO: get the sender ssrc working right, i think we may be getting the wrong
-                        // one somehow
-                        if (pkt.header.senderSsrc == 0L) {
-                            pkt.header.senderSsrc = senderSsrc
-                        }
-                        pkt.getBuffer()
-//                        logger.cinfo { "Sending RTCP\n$pkt\n\n${pkt.getBuffer().toHex()}" }
-                    }
-                    return@simpleNode pktInfos
+            // TODO(brian): not sure this is a great idea.  it works as a catch-call but can also be error-prone
+            // (i found i was accidentally clobbering the sender ssrc for SRs which caused issues).  I think
+            // it'd be better to notify everything creating RTCP the bridge SSRCs and then everything should be
+            // responsible for setting it themselves
+            simpleNode("RTCP sender ssrc setter") { packetInfo ->
+                val senderSsrc = localVideoSsrc ?: return@simpleNode packetInfo
+                val rtcpPacket = packetInfo.packetAs<RtcpPacket>()
+                if (rtcpPacket.senderSsrc == 0L) {
+                    rtcpPacket.senderSsrc = senderSsrc
                 }
-                emptyList()
+                packetInfo
             }
+            node(rtcpSrUpdater)
+            node(toggleablePcapWriter.newObserverNode())
             node(srtcpEncryptWrapper)
+            node(packetStreamStats.createNewNode())
+            node(PacketLossNode(packetLossConfig), condition = { packetLossConfig.enabled })
             node(outputPipelineTerminationNode)
         }
-        executor.execute(this::doWork)
+
+        probingDataSender = ProbingDataSender(
+            outgoingPacketCache.getPacketCache(), outgoingRtxRoot, absSendTime, diagnosticContext,
+            streamInformationStore,
+            logger
+        )
     }
 
-    override fun sendPackets(pkts: List<PacketInfo>) {
-        pkts.forEach {
-            numIncomingBytes += it.packet.size
-            it.addEvent(PACKET_QUEUE_ENTRY_EVENT)
-        }
-        incomingPacketQueue.addAll(pkts)
-        if (firstPacketWrittenTime == -1L) {
-            firstPacketWrittenTime = System.currentTimeMillis()
-        }
-        lastPacketWrittenTime = System.currentTimeMillis()
+    override fun onRttUpdate(newRttMs: Double) {
+        nackHandler.onRttUpdate(newRttMs)
+        keyframeRequester.onRttUpdate(newRttMs)
+        transportCcEngine.onRttUpdate(Duration.ofNanos((newRttMs * 1e6).toLong()))
     }
 
-    override fun sendRtcp(pkts: List<RtcpPacket>) {
-        pkts.forEach {
-            rtcpEventNotifier.notifyRtcpSent(it)
-        }
-        //TODO: do we want to allow for PacketInfo to be passed in to sendRtcp?
-        outgoingRtcpRoot.processPackets(pkts.map { PacketInfo(it) })
-    }
-
-    override fun setSrtpTransformer(srtpTransformer: SinglePacketTransformer) {
-        srtpEncryptWrapper.setTransformer(srtpTransformer)
-    }
-
-    override fun setSrtcpTransformer(srtcpTransformer: SinglePacketTransformer) {
-        srtcpEncryptWrapper.setTransformer(srtcpTransformer)
-    }
-
-    private fun doWork() {
-        while (running) {
-            val now = System.currentTimeMillis()
-            if (firstQueueReadTime == -1L) {
-                firstQueueReadTime = now
+    /**
+     * Insert packets into the incoming packet queue
+     */
+    override fun doProcessPacket(packetInfo: PacketInfo) {
+        if (running) {
+            val packet = packetInfo.packet
+            if (packet is RtcpPacket) {
+                rtcpEventNotifier.notifyRtcpSent(packet)
             }
-            numQueueReads++
-            lastQueueReadTime = now
-            incomingPacketQueue.poll(100, TimeUnit.MILLISECONDS)?.let {
-                it.addEvent(PACKET_QUEUE_EXIT_EVENT)
-                outgoingRtpRoot.processPackets(listOf(it))
-            }
+            packetInfo.addEvent(PACKET_QUEUE_ENTRY_EVENT)
+            incomingPacketQueue.add(packetInfo)
+        } else {
+            BufferPool.returnBuffer(packetInfo.packet.buffer)
         }
     }
 
-    override fun getStreamStats(): Map<Long, OutgoingStreamStatistics.Snapshot> {
-        return statTracker.getCurrentStats().map { (ssrc, stats) ->
-            Pair(ssrc, stats.getSnapshot())
-        }.toMap()
+    override fun sendProbing(mediaSsrcs: Collection<Long>, numBytes: Int): Int =
+        probingDataSender.sendProbing(mediaSsrcs, numBytes)
+
+    override fun onOutgoingPacket(handler: PacketHandler) {
+        outgoingPacketHandler = handler
     }
+
+    override fun setSrtpTransformers(srtpTransformers: SrtpTransformers) {
+        srtpEncryptWrapper.transformer = srtpTransformers.srtpEncryptTransformer
+        srtcpEncryptWrapper.transformer = srtpTransformers.srtcpEncryptTransformer
+    }
+
+    override fun requestKeyframe(mediaSsrc: Long?) {
+        keyframeRequester.requestKeyframe(mediaSsrc)
+    }
+
+    /**
+     * Handles packets that have gone through the incoming queue and sends them
+     * through the sender pipeline
+     */
+    private fun handlePacket(packetInfo: PacketInfo): Boolean {
+        return if (running) {
+            packetInfo.addEvent(PACKET_QUEUE_EXIT_EVENT)
+
+            val root = when (packetInfo.packet) {
+                is RtcpPacket -> outgoingRtcpRoot
+                else -> outgoingRtpRoot
+            }
+            root.processPacket(packetInfo)
+            true
+        } else {
+            BufferPool.returnBuffer(packetInfo.packet.buffer)
+            false
+        }
+    }
+
+    override fun getStreamStats() = statsTracker.getSnapshot()
+
+    override fun getPacketStreamStats() = packetStreamStats.snapshot()
+
+    override fun getTransportCcEngineStats() = transportCcEngine.getStatistics()
 
     override fun handleEvent(event: Event) {
-        outputPipelineTerminationNode.reverseVisit(NodeEventVisitor(event))
+        when (event) {
+            is SetLocalSsrcEvent -> {
+                when (event.mediaType) {
+                    MediaType.VIDEO -> localVideoSsrc = event.ssrc
+                    MediaType.AUDIO -> localAudioSsrc = event.ssrc
+                    else -> {}
+                }
+            }
+        }
+        NodeEventVisitor(event).reverseVisit(outputPipelineTerminationNode)
+        probingDataSender.handleEvent(event)
     }
 
-    override fun getNodeStats(): NodeStatsBlock {
-        val bitRateMbps = getMbps(numBytesSent, Duration.ofMillis(lastPacketSentTime - firstPacketSentTime))
-        return NodeStatsBlock("RTP sender $id").apply {
-            addStat("queue size: ${incomingPacketQueue.size}")
-            addStat("$numIncomingBytes incoming bytes in ${lastPacketWrittenTime - firstPacketWrittenTime} (${getMbps(numIncomingBytes, Duration.ofMillis(lastPacketWrittenTime - firstPacketWrittenTime))} mbps)")
-            addStat("Sent $numPacketsSent packets in ${lastPacketSentTime - firstPacketSentTime} ms")
-            addStat("Sent $numBytesSent bytes in ${lastPacketSentTime - firstPacketSentTime} ms ($bitRateMbps mbps)")
-            val queueReadTotal = lastQueueReadTime - firstQueueReadTime
-            addStat("Read from queue at a rate of " +
-                    "${numQueueReads / (Duration.ofMillis(queueReadTotal).seconds.toDouble())} times per second")
-            addStat("The queue was empty $numTimesQueueEmpty out of $numQueueReads times")
-            addStat("Nack handler", nackHandler.getNodeStats())
-            val statsVisitor = NodeStatsVisitor(this)
-            outputPipelineTerminationNode.reverseVisit(statsVisitor)
-        }
+    override fun getNodeStats(): NodeStatsBlock = NodeStatsBlock("RTP sender $id").apply {
+        addBlock(nackHandler.getNodeStats())
+        addBlock(probingDataSender.getNodeStats())
+        addJson("packetQueue", incomingPacketQueue.debugState)
+        NodeStatsVisitor(this).reverseVisit(outputPipelineTerminationNode)
+
+        addString("running", running.toString())
+        addString("localVideoSsrc", localVideoSsrc?.toString() ?: "null")
+        addString("localAudioSsrc", localAudioSsrc?.toString() ?: "null")
+        addJson("transportCcEngine", transportCcEngine.getStatistics().toJson())
+        addJson("Bandwidth Estimation", bandwidthEstimator.getStats().toJson())
     }
 
     override fun stop() {
         running = false
-        rtcpSrGenerator.running = false
+    }
+
+    override fun tearDown() {
+        logger.info("Tearing down")
+        NodeTeardownVisitor().reverseVisit(outputPipelineTerminationNode)
+        incomingPacketQueue.close()
+        toggleablePcapWriter.disable()
+    }
+
+    companion object {
+        val queueErrorCounter = CountingErrorHandler()
+
+        private const val PACKET_QUEUE_ENTRY_EVENT = "Entered RTP sender incoming queue"
+        private const val PACKET_QUEUE_EXIT_EVENT = "Exited RTP sender incoming queue"
+
+        /**
+         * Configuration for the packet loss to introduce in the send pipeline (for debugging/testing purposes).
+         */
+        private val packetLossConfig = PacketLossConfig("jmt.debug.packet-loss.outgoing")
     }
 }

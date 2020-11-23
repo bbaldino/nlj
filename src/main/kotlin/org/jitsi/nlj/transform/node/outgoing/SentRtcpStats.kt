@@ -17,33 +17,25 @@
 package org.jitsi.nlj.transform.node.outgoing
 
 import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.forEachAs
 import org.jitsi.nlj.stats.NodeStatsBlock
-import org.jitsi.nlj.transform.node.Node
+import org.jitsi.nlj.transform.node.ObserverNode
 import org.jitsi.rtp.rtcp.RtcpPacket
-import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbFirPacket
-import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbPliPacket
 
-class SentRtcpStats : Node("Sent RTCP stats") {
-    private var numPlisSent = 0
-    private var numFirsSent = 0
+class SentRtcpStats : ObserverNode("Sent RTCP stats") {
+    private var sentRtcpCounts = mutableMapOf<String, Int>()
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        p.forEachAs<RtcpPacket> { packetInfo, expectedPacketType ->
-            when (expectedPacketType) {
-                is RtcpFbPliPacket -> numPlisSent++
-                is RtcpFbFirPacket -> numFirsSent++
-            }
-        }
-        next(p)
+    override fun observe(packetInfo: PacketInfo) {
+        val rtcpPacket: RtcpPacket = packetInfo.packetAs()
+        sentRtcpCounts.merge(rtcpPacket::class.simpleName!!, 1, Int::plus)
     }
 
     override fun getNodeStats(): NodeStatsBlock {
-        val parentStats = super.getNodeStats()
-        return NodeStatsBlock(name).apply {
-            addAll(parentStats)
-            addStat("num PLI packets tx: $numPlisSent")
-            addStat("num FIR packets tx: $numFirsSent")
+        return super.getNodeStats().apply {
+            sentRtcpCounts.forEach { (rtcpType, count) ->
+                addNumber("num_${rtcpType}_tx", count)
+            }
         }
     }
+
+    override fun trace(f: () -> Unit) = f.invoke()
 }

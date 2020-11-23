@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,29 +15,49 @@
  */
 package org.jitsi.nlj.transform.node.outgoing
 
-import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.forEachAs
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.rtp.RtpPacket
 import java.util.concurrent.ConcurrentHashMap
+import org.jitsi.nlj.PacketInfo
+import org.jitsi.nlj.transform.node.ObserverNode
+import org.jitsi.rtp.rtp.RtpPacket
 
-class OutgoingStatisticsTracker : Node("Outgoing statistics tracker") {
-    private val streamStats: MutableMap<Long, OutgoingStreamStatistics> = ConcurrentHashMap()
+class OutgoingStatisticsTracker : ObserverNode("Outgoing statistics tracker") {
+    /**
+     * Per-SSRC statistics
+     */
+    private val ssrcStats: MutableMap<Long, OutgoingSsrcStats> = ConcurrentHashMap()
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        p.forEachAs<RtpPacket> { pktInfo, rtpPacket ->
-            val stats = streamStats.computeIfAbsent(rtpPacket.header.ssrc) {
-                OutgoingStreamStatistics(rtpPacket.header.ssrc)
-            }
-            stats.packetSent(rtpPacket.size, rtpPacket.header.timestamp)
+    override fun observe(packetInfo: PacketInfo) {
+        val rtpPacket = packetInfo.packetAs<RtpPacket>()
+
+        val stats = ssrcStats.computeIfAbsent(rtpPacket.ssrc) {
+            OutgoingSsrcStats(rtpPacket.ssrc)
         }
-        next(p)
+        stats.packetSent(rtpPacket.length, rtpPacket.timestamp)
     }
 
-    fun getCurrentStats(): Map<Long, OutgoingStreamStatistics> = streamStats.toMap()
+    override fun trace(f: () -> Unit) = f.invoke()
+
+    fun getSnapshot(): OutgoingStatisticsSnapshot {
+        return OutgoingStatisticsSnapshot(
+            ssrcStats.map { (ssrc, stats) ->
+                Pair(ssrc, stats.getSnapshot())
+            }.toMap()
+        )
+    }
+
+    fun getSsrcSnapshot(ssrc: Long): OutgoingSsrcStats.Snapshot? {
+        return ssrcStats[ssrc]?.getSnapshot()
+    }
 }
 
-class OutgoingStreamStatistics(
+class OutgoingStatisticsSnapshot(
+    /**
+     * Per-ssrc stats.
+     */
+    val ssrcStats: Map<Long, OutgoingSsrcStats.Snapshot>
+)
+
+class OutgoingSsrcStats(
     private val ssrc: Long
 ) {
     private var statsLock = Any()
@@ -48,7 +68,7 @@ class OutgoingStreamStatistics(
     // End variables protected by statsLock
 
     fun packetSent(packetSizeOctets: Int, rtpTimestamp: Long) {
-        synchronized (statsLock) {
+        synchronized(statsLock) {
             packetCount++
             octetCount += packetSizeOctets
             mostRecentRtpTimestamp = rtpTimestamp
@@ -56,7 +76,7 @@ class OutgoingStreamStatistics(
     }
 
     fun getSnapshot(): Snapshot {
-        synchronized (statsLock) {
+        synchronized(statsLock) {
             return Snapshot(packetCount, octetCount, mostRecentRtpTimestamp)
         }
     }

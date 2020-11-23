@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,93 +15,181 @@
  */
 package org.jitsi.nlj.transform.node.incoming
 
-import org.jitsi.nlj.Event
+import java.time.Clock
+import java.time.Duration
+import java.time.Instant
+import java.util.TreeMap
 import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.ReceiveSsrcAddedEvent
-import org.jitsi.nlj.ReceiveSsrcRemovedEvent
-import org.jitsi.nlj.RtpExtensionAddedEvent
-import org.jitsi.nlj.RtpExtensionClearEvent
-import org.jitsi.nlj.forEachAs
+import org.jitsi.nlj.rtp.RtpExtensionType.TRANSPORT_CC
 import org.jitsi.nlj.stats.NodeStatsBlock
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.rtp.SrtpPacket
+import org.jitsi.nlj.transform.node.ObserverNode
+import org.jitsi.nlj.util.BitrateTracker
+import org.jitsi.nlj.util.NEVER
+import org.jitsi.nlj.util.ReadOnlyStreamInformationStore
+import org.jitsi.nlj.util.Rfc3711IndexTracker
+import org.jitsi.nlj.util.bytes
+import org.jitsi.utils.logging2.cdebug
+import org.jitsi.utils.observableWhenChanged
 import org.jitsi.rtp.rtcp.RtcpPacket
-import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbTccPacket
-import org.jitsi.rtp.rtcp.rtcpfb.Tcc
-import org.jitsi.service.neomedia.RTPExtension
-import unsigned.toUInt
+import org.jitsi.rtp.rtcp.rtcpfb.transport_layer_fb.tcc.RtcpFbTccPacket
+import org.jitsi.rtp.rtcp.rtcpfb.transport_layer_fb.tcc.RtcpFbTccPacketBuilder
+import org.jitsi.rtp.rtp.RtpPacket
+import org.jitsi.rtp.rtp.header_extensions.TccHeaderExtension
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.logging2.createChildLogger
+import org.jitsi.utils.ms
+import org.jitsi.utils.secs
 
 /**
  * Extract the TCC sequence numbers from each passing packet and generate
  * a TCC packet to send transmit to the sender.
  */
 class TccGeneratorNode(
-    private val onTccPacketReady: (RtcpPacket) -> Unit = {}
-) : Node("TCC generator") {
+    private val onTccPacketReady: (RtcpPacket) -> Unit = {},
+    private val streamInformation: ReadOnlyStreamInformationStore,
+    parentLogger: Logger,
+    private val clock: Clock = Clock.systemDefaultZone()
+) : ObserverNode("TCC generator") {
+    private val logger = createChildLogger(parentLogger)
     private var tccExtensionId: Int? = null
     private var currTccSeqNum: Int = 0
-    private var currTcc: RtcpFbTccPacket = RtcpFbTccPacket(fci = Tcc(feedbackPacketCount = currTccSeqNum++))
-    private var lastTccSentTime: Long = 0
-    /**
-     * Ssrc's we've been told this endpoint will transmit on.  We'll use an
-     * ssrc from this list for the RTCPFB mediaSourceSsrc field in the
-     * TCC packets we generate
-     */
-    private var mediaSsrcs: MutableSet<Long> = mutableSetOf()
+    private var lastTccSentTime: Instant = NEVER
+    private val lock = Any()
+    // Tcc seq num -> arrival time in ms
+    private val packetArrivalTimes = TreeMap<Int, Long>()
+    // The first sequence number of the current tcc feedback packet
+    private var windowStartSeq: Int = -1
+    private val tccFeedbackBitrate = BitrateTracker(1.secs, 10.ms)
     private var numTccSent: Int = 0
+    private var numMultipleTccPackets = 0
+    private var enabled: Boolean by observableWhenChanged(false) {
+        _, _, newValue ->
+        logger.debug("Setting enabled=$newValue")
+    }
+    private val rfc3711IndexTracker = Rfc3711IndexTracker()
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
+    init {
+        streamInformation.onRtpExtensionMapping(TRANSPORT_CC) {
+            tccExtensionId = it
+        }
+        streamInformation.onRtpPayloadTypesChanged {
+            enabled = streamInformation.supportsTcc
+        }
+    }
+
+    override fun observe(packetInfo: PacketInfo) {
+        if (!enabled) return
+
         tccExtensionId?.let { tccExtId ->
-            p.forEachAs<SrtpPacket> { pktInfo, pkt ->
-                pkt.header.getExtension(tccExtId).let currPkt@ { tccExt ->
-                    //TODO: check if it's a one byte or two byte ext?
-                    // TODO: add a tcc ext type that handles the seq num parsing?
-                    val tccSeqNum = tccExt?.data?.getShort(0)?.toUInt() ?: return@currPkt
-                    addPacket(tccSeqNum, pktInfo.receivedTime)
-                }
+            val rtpPacket = packetInfo.packetAs<RtpPacket>()
+            rtpPacket.getHeaderExtension(tccExtId)?.let { ext ->
+                val tccSeqNum = rfc3711IndexTracker.update(TccHeaderExtension.getSequenceNumber(ext))
+                addPacket(tccSeqNum, packetInfo.receivedTime, rtpPacket.isMarked, rtpPacket.ssrc)
             }
         }
-        next(p)
     }
 
-    override fun handleEvent(event: Event) {
-        when (event) {
-            is RtpExtensionAddedEvent -> {
-                if (RTPExtension.TRANSPORT_CC_URN.equals(event.rtpExtension.uri.toString())) {
-                    tccExtensionId = event.extensionId.toUInt()
-                    logger.cinfo { "TCC generator setting extension ID to $tccExtensionId" }
-                }
+    /**
+     * @param tccSeqNum the extended sequence number.
+     */
+    private fun addPacket(tccSeqNum: Int, timestamp: Long, isMarked: Boolean, ssrc: Long) {
+        synchronized(lock) {
+            if (packetArrivalTimes.ceilingKey(windowStartSeq) == null) {
+                // Packets in map are all older than the start of the next tcc feedback packet,
+                // remove them
+                // TODO: Chrome does something more advanced, keeping older sequences to replay on packet reordering.
+                packetArrivalTimes.clear()
             }
-            is RtpExtensionClearEvent -> tccExtensionId = null
-            is ReceiveSsrcAddedEvent -> mediaSsrcs.add(event.ssrc)
-            is ReceiveSsrcRemovedEvent -> mediaSsrcs.remove(event.ssrc)
+            if (windowStartSeq == -1 || tccSeqNum < windowStartSeq) {
+                windowStartSeq = tccSeqNum
+            }
+
+            packetArrivalTimes.putIfAbsent(tccSeqNum, timestamp)
+            if (isTccReadyToSend(isMarked)) {
+                buildFeedback(ssrc).forEach { sendTcc(it) }
+            }
         }
     }
 
-    private fun addPacket(tccSeqNum: Int, timestamp: Long) {
-        currTcc.getFci().addPacket(tccSeqNum, timestamp)
+    private fun buildFeedback(mediaSsrc: Long): List<RtcpFbTccPacket> {
+        synchronized(lock) {
+            // windowStartSeq is the first sequence number to include in the current feedback, but we may not have
+            // received it so the base time shall be the time of the first received packet which will be included
+            // in this feedback
+            val firstEntry = packetArrivalTimes.ceilingEntry(windowStartSeq) ?: return emptyList()
 
-        if (isTccReadyToSend()) {
-            val mediaSsrc = if (mediaSsrcs.isNotEmpty()) mediaSsrcs.iterator().next() else -1L
-            currTcc.mediaSourceSsrc = mediaSsrc
-            onTccPacketReady(currTcc)
-            numTccSent++
-            // Create a new TCC instance for the next set of information
-            currTcc = RtcpFbTccPacket(fci = Tcc(feedbackPacketCount = currTccSeqNum++))
+            val tccPackets = mutableListOf<RtcpFbTccPacket>()
+            var currentTccPacket = RtcpFbTccPacketBuilder(
+                mediaSourceSsrc = mediaSsrc,
+                feedbackPacketSeqNum = currTccSeqNum++
+            )
+            currentTccPacket.SetBase(windowStartSeq, firstEntry.value * 1000)
+
+            var nextSequenceNumber = windowStartSeq
+            val feedbackBlockPackets = packetArrivalTimes.tailMap(windowStartSeq)
+            feedbackBlockPackets.forEach { (seq, timestampMs) ->
+                val timestampUs = timestampMs * 1000
+                if (!currentTccPacket.AddReceivedPacket(seq, timestampUs)) {
+                    tccPackets.add(currentTccPacket.build())
+                    currentTccPacket = RtcpFbTccPacketBuilder(
+                        mediaSourceSsrc = mediaSsrc,
+                        feedbackPacketSeqNum = currTccSeqNum++
+                    ).apply {
+                        SetBase(seq, timestampUs)
+                        AddReceivedPacket(seq, timestampUs)
+                    }
+                }
+                nextSequenceNumber = seq + 1
+            }
+
+            tccPackets.add(currentTccPacket.build())
+            if (tccPackets.size > 1) {
+                numMultipleTccPackets++
+                logger.info(
+                    "Sending TCC feedback in ${tccPackets.size} packets " +
+                        "(${feedbackBlockPackets.size} media packets)"
+                )
+            }
+            // The next window will start with the sequence number after the last one we included in the previous
+            // feedback
+            windowStartSeq = nextSequenceNumber
+
+            return tccPackets
         }
     }
 
-    private fun isTccReadyToSend(): Boolean {
-        return (System.currentTimeMillis() - lastTccSentTime >= 70) ||
-            currTcc.numPackets() >= 20
+    private fun sendTcc(tccPacket: RtcpFbTccPacket) {
+        onTccPacketReady(tccPacket)
+        logger.cdebug { "sent TCC packet with seq num ${tccPacket.feedbackSeqNum}" }
+        numTccSent++
+        lastTccSentTime = clock.instant()
+        tccFeedbackBitrate.update(tccPacket.length.bytes, clock.millis())
     }
+
+    private fun isTccReadyToSend(currentPacketMarked: Boolean): Boolean {
+        val now = clock.instant()
+        // We don't want to send TCC the very first time we check (which would
+        // be after the first packet was added).  So the first time we check,
+        // set the last sent time to now to delay sending TCC by at least one 'interval'
+        if (lastTccSentTime == NEVER) {
+            lastTccSentTime = now
+            return false
+        }
+
+        val timeSinceLastTcc = Duration.between(lastTccSentTime, now)
+        return timeSinceLastTcc >= 100.ms ||
+            ((timeSinceLastTcc >= 20.ms) && currentPacketMarked)
+    }
+
+    override fun trace(f: () -> Unit) = f.invoke()
 
     override fun getNodeStats(): NodeStatsBlock {
-        val parentStats = super.getNodeStats()
-        return NodeStatsBlock(name).apply {
-            addAll(parentStats)
-            addStat( "num tcc packets sent: $numTccSent")
+        return super.getNodeStats().apply {
+            addNumber("num_tcc_packets_sent", numTccSent)
+            addNumber("tcc_feedback_bitrate_bps", tccFeedbackBitrate.rate.bps)
+            addString("tcc_extension_id", tccExtensionId.toString())
+            addNumber("num_multiple_tcc_packets", numMultipleTccPackets)
+            addBoolean("enabled", enabled)
         }
     }
 }

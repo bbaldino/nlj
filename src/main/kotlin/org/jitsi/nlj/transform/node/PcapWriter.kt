@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,12 @@
  */
 package org.jitsi.nlj.transform.node
 
+import java.net.Inet4Address
+import java.util.Random
 import org.jitsi.nlj.PacketInfo
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.rtp.extensions.toHex
+import org.jitsi.utils.logging2.cinfo
+import org.jitsi.utils.logging2.createChildLogger
+import org.jitsi.utils.logging2.Logger
 import org.pcap4j.core.Pcaps
 import org.pcap4j.packet.EthernetPacket
 import org.pcap4j.packet.IpV4Packet
@@ -30,64 +33,73 @@ import org.pcap4j.packet.namednumber.IpNumber
 import org.pcap4j.packet.namednumber.IpVersion
 import org.pcap4j.packet.namednumber.UdpPort
 import org.pcap4j.util.MacAddress
-import java.net.Inet4Address
-import java.nio.ByteBuffer
-import java.util.Arrays
-import java.util.Random
-
 
 class PcapWriter(
+    parentLogger: Logger,
     filePath: String = "/tmp/${Random().nextLong()}.pcap}"
-) : Node("PCAP writer") {
-    val handle = Pcaps.openDead(DataLinkType.EN10MB, 65536);
-    val writer = handle.dumpOpen(filePath)
-
-    init {
-        logger.cinfo { "Pcap writer writing to file $filePath" }
+) : ObserverNode("PCAP writer") {
+    private val logger = createChildLogger(parentLogger)
+    private val lazyHandle = lazy {
+        Pcaps.openDead(DataLinkType.EN10MB, 65536)
     }
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        p.forEach {
-            val udpPayload = UnknownPacket.Builder()
-            val pktBuf = it.packet.getBuffer()
-            // We can't pass offset/limit values to udpPayload.rawData, so we need to create an array that contains
-            // only exactly what we want to write
-            val subBuf = ByteBuffer.wrap(
-                Arrays.copyOfRange(
-                    pktBuf.array(),
-                    pktBuf.arrayOffset(),
-                    pktBuf.arrayOffset() + pktBuf.limit()
-                )
-            )
-            udpPayload.rawData(subBuf.array())
-            val udp = UdpPacket.Builder()
-                .srcPort(UdpPort(123, "blah"))
-                .dstPort(UdpPort(456, "blah"))
-                .srcAddr(Inet4Address.getLocalHost() as Inet4Address)
-                .dstAddr(Inet4Address.getLocalHost() as Inet4Address)
-                .correctChecksumAtBuild(true)
-                .correctLengthAtBuild(true)
-                .payloadBuilder(udpPayload)
+    private val handle by lazyHandle
 
-            val ipPacket = IpV4Packet.Builder()
-                .srcAddr(Inet4Address.getLocalHost() as Inet4Address)
-                .dstAddr(Inet4Address.getLocalHost() as Inet4Address)
-                .protocol(IpNumber.UDP)
-                .version(IpVersion.IPV4)
-                .tos(IpV4Rfc1349Tos.newInstance(0))
-                .correctLengthAtBuild(true)
-                .payloadBuilder(udp)
+    private val lazyWriter = lazy {
+        logger.cinfo { "Pcap writer writing to file $filePath" }
+        handle.dumpOpen(filePath)
+    }
 
-            val eth = EthernetPacket.Builder()
-                .srcAddr(MacAddress.ETHER_BROADCAST_ADDRESS)
-                .dstAddr(MacAddress.ETHER_BROADCAST_ADDRESS)
-                .type(EtherType.IPV4)
-                .paddingAtBuild(true)
-                .payloadBuilder(ipPacket)
-                .build()
+    private val writer by lazyWriter
 
-            writer.dump(eth)
+    companion object {
+        private val localhost = Inet4Address.getByName("127.0.0.1") as Inet4Address
+    }
+
+    override fun observe(packetInfo: PacketInfo) {
+        val udpPayload = UnknownPacket.Builder()
+        // We can't pass offset/limit values to udpPayload.rawData, so we need to create an array that contains
+        // only exactly what we want to write
+        val subBuf = ByteArray(packetInfo.packet.length)
+        System.arraycopy(packetInfo.packet.buffer, packetInfo.packet.offset, subBuf, 0, packetInfo.packet.length)
+        udpPayload.rawData(subBuf)
+        val udp = UdpPacket.Builder()
+            .srcPort(UdpPort(123, "blah"))
+            .dstPort(UdpPort(456, "blah"))
+            .srcAddr(localhost)
+            .dstAddr(localhost)
+            .correctChecksumAtBuild(true)
+            .correctLengthAtBuild(true)
+            .payloadBuilder(udpPayload)
+
+        val ipPacket = IpV4Packet.Builder()
+            .srcAddr(localhost)
+            .dstAddr(localhost)
+            .protocol(IpNumber.UDP)
+            .version(IpVersion.IPV4)
+            .tos(IpV4Rfc1349Tos.newInstance(0))
+            .correctLengthAtBuild(true)
+            .payloadBuilder(udp)
+
+        val eth = EthernetPacket.Builder()
+            .srcAddr(MacAddress.ETHER_BROADCAST_ADDRESS)
+            .dstAddr(MacAddress.ETHER_BROADCAST_ADDRESS)
+            .type(EtherType.IPV4)
+            .paddingAtBuild(true)
+            .payloadBuilder(ipPacket)
+            .build()
+
+        writer.dump(eth)
+    }
+
+    override fun trace(f: () -> Unit) = f.invoke()
+
+    fun close() {
+        if (lazyWriter.isInitialized() && writer.isOpen) {
+            writer.close()
         }
 
-        next(p)
+        if (lazyHandle.isInitialized() && handle.isOpen) {
+            handle.close()
+        }
     }
 }

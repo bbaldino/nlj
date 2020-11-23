@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,82 +18,120 @@ package org.jitsi.nlj.transform.node.incoming
 import org.jitsi.nlj.PacketInfo
 import org.jitsi.nlj.rtcp.RtcpEventNotifier
 import org.jitsi.nlj.stats.NodeStatsBlock
-import org.jitsi.nlj.transform.node.Node
-import org.jitsi.nlj.util.cdebug
-import org.jitsi.nlj.util.cinfo
-import org.jitsi.rtp.extensions.toHex
+import org.jitsi.nlj.transform.node.TransformerNode
+import org.jitsi.nlj.util.BufferPool
+import org.jitsi.utils.logging2.cdebug
+import org.jitsi.utils.logging2.cinfo
+import org.jitsi.rtp.rtcp.CompoundRtcpPacket
 import org.jitsi.rtp.rtcp.RtcpByePacket
+import org.jitsi.rtp.rtcp.RtcpPacket
 import org.jitsi.rtp.rtcp.RtcpRrPacket
 import org.jitsi.rtp.rtcp.RtcpSdesPacket
 import org.jitsi.rtp.rtcp.RtcpSrPacket
-import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbFirPacket
-import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbNackPacket
-import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbPliPacket
-import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbTccPacket
-import org.jitsi_modified.impl.neomedia.rtp.TransportCCEngine
+import org.jitsi.rtp.rtcp.RtcpXrPacket
+import org.jitsi.rtp.rtcp.rtcpfb.UnsupportedRtcpFbPacket
+import org.jitsi.rtp.rtcp.rtcpfb.payload_specific_fb.RtcpFbFirPacket
+import org.jitsi.rtp.rtcp.rtcpfb.payload_specific_fb.RtcpFbPliPacket
+import org.jitsi.rtp.rtcp.rtcpfb.payload_specific_fb.RtcpFbRembPacket
+import org.jitsi.rtp.rtcp.rtcpfb.transport_layer_fb.RtcpFbNackPacket
+import org.jitsi.rtp.rtcp.rtcpfb.transport_layer_fb.tcc.RtcpFbTccPacket
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.logging2.createChildLogger
 
 class RtcpTermination(
     private val rtcpEventNotifier: RtcpEventNotifier,
-    private val transportCcEngine: TransportCCEngine? = null
-) : Node("RTCP termination") {
-    private var numNacksReceived = 0
-    private var numFirsReceived = 0
-    private var numPlisReceived = 0
+    parentLogger: Logger
+) : TransformerNode("RTCP termination") {
+    private val logger = createChildLogger(parentLogger)
+    private var packetReceiveCounts = mutableMapOf<String, Int>()
+    /**
+     * Number of packets we failed to forward because a compound packet contained more than one
+     * packet we wanted to forward. Ideally this shouldn't happen.
+     */
+    private var numFailedToForward = 0
 
-    override fun doProcessPackets(p: List<PacketInfo>) {
-        val outPackets = mutableListOf<PacketInfo>()
-        p.forEach { packetInfo ->
-            val pkt = packetInfo.packet
-            when (pkt) {
-                is RtcpFbTccPacket -> handleTccPacket(pkt)
-                is RtcpFbNackPacket -> {
-                    numNacksReceived++
-                }
-                is RtcpSrPacket -> {
-                    //TODO
-                }
-                is RtcpRrPacket -> {
-                    //TODO
-                }
-                is RtcpByePacket -> {
-                    logger.cinfo { "BRIAN: got BYE packet:\n ${pkt.getBuffer().toHex()}"}
-                    //TODO
-                }
-                is RtcpSdesPacket -> {
-                    //TODO
-                }
-                is RtcpFbPliPacket, is RtcpFbFirPacket -> {
-                    if (pkt is RtcpFbPliPacket) {
-                        numPlisReceived++
-                    } else {
-                        numFirsReceived++
+    override fun transform(packetInfo: PacketInfo): PacketInfo? {
+        val compoundRtcp = packetInfo.packetAs<CompoundRtcpPacket>()
+        var forwardedRtcp: RtcpPacket? = null
+
+        compoundRtcp.packets.forEach { rtcpPacket ->
+            when (rtcpPacket) {
+                is RtcpFbPliPacket, is RtcpFbFirPacket, is RtcpSrPacket -> {
+                    // We'll let these pass through and be forwarded to the conference (where they will be
+                    // routed to the other endpoint(s))
+                    // NOTE(brian): this should work fine as long as we can't receive 2 RTCP packets
+                    // we want to forward in the same compound packet.  If we can, then we may need
+                    // to turn this into a MultipleOutputNode
+                    forwardedRtcp?.let {
+                        logger.cinfo {
+                            "Failed to forward a packet of type ${it::class.simpleName} " +
+                                ". Replaced by ${rtcpPacket::class.simpleName}."
+                        }
+                        numFailedToForward++
                     }
-                    // We'll let these pass through and be forwarded to the sender who will be
-                    // responsible for translating/aggregating them
-                    logger.cdebug { "BRIAN: passing through ${pkt::class} rtcp packet: ${pkt.getBuffer().toHex()}" }
-                    outPackets.add(packetInfo)
+                    forwardedRtcp = rtcpPacket
+                }
+                is RtcpSdesPacket, is RtcpRrPacket, is RtcpFbNackPacket,
+                is RtcpByePacket, is RtcpFbTccPacket, is RtcpFbRembPacket -> {
+                    // Supported, but no special handling here (any special handling will be in
+                    // notifyRtcpReceived below
+                }
+                is RtcpXrPacket -> {
+                    // Unsupported, but we get them when chrome does screenshare and the
+                    // message below clouds up the logs.  They are still tracked as part
+                    // of the packetReceiveCount
+                }
+                is UnsupportedRtcpFbPacket -> {
+                    logger.cinfo {
+                        "TODO: not yet handling RTCP packet of type ${rtcpPacket.packetType} fmt " +
+                            "${rtcpPacket.reportCount} ${rtcpPacket.javaClass}"
+                    }
                 }
                 else -> {
-                    logger.cinfo { "TODO: not yet handling RTCP packet of type ${pkt.javaClass}"}
+                    logger.cinfo {
+                        "TODO: not yet handling RTCP packet of type ${rtcpPacket.packetType} " +
+                            "${rtcpPacket.javaClass}"
+                    }
                 }
             }
-            //TODO: keep an eye on if anything in here takes a while it could slow the packet pipeline down
-            rtcpEventNotifier.notifyRtcpReceived(packetInfo)
-        }
-        next(outPackets)
-    }
+            // TODO: keep an eye on if anything in here takes a while it could slow the packet pipeline down
+            packetReceiveCounts.merge(rtcpPacket::class.simpleName!!, 1, Int::plus)
+            rtcpEventNotifier.notifyRtcpReceived(rtcpPacket, packetInfo.receivedTime)
 
-    private fun handleTccPacket(tccPacket: RtcpFbTccPacket) {
-        transportCcEngine?.tccReceived(tccPacket)
+            (forwardedRtcp as? RtcpSrPacket)?.let {
+                logger.cdebug {
+                    "Saw an sr from ssrc=${rtcpPacket.senderSsrc}, " +
+                        "timestamp=${it.senderInfo.rtpTimestamp}"
+                }
+                forwardedRtcp = if (it.reportCount > 0) {
+                    // Eliminates any report blocks as we don't want to relay those
+                    it.cloneWithoutReportBlocks()
+                } else {
+                    it
+                }
+            }
+        }
+
+        return forwardedRtcp?.let {
+            if (it.buffer != packetInfo.packet.buffer) {
+                // We're not using the original packet's buffer, so we can return it to the pool
+                BufferPool.returnBuffer(packetInfo.packet.buffer)
+            }
+            packetInfo.packet = it
+            packetInfo
+        } ?: run {
+            null
+        }
     }
 
     override fun getNodeStats(): NodeStatsBlock {
-        val parentStats = super.getNodeStats()
-        return NodeStatsBlock(name).apply {
-            addAll(parentStats)
-            addStat("num NACK packets rx: $numNacksReceived")
-            addStat("num PLI packets rx: $numPlisReceived")
-            addStat("num FIR packets rx: $numFirsReceived")
+        return super.getNodeStats().apply {
+            packetReceiveCounts.forEach { type, count ->
+                addNumber("num_${type}_rx", count)
+            }
+            addNumber("num_failed_to_forward", numFailedToForward)
         }
     }
+
+    override fun trace(f: () -> Unit) = f.invoke()
 }

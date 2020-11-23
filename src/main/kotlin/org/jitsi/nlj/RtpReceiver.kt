@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,42 +15,57 @@
  */
 package org.jitsi.nlj
 
-import org.jitsi.impl.neomedia.transform.SinglePacketTransformer
-import org.jitsi.nlj.rtcp.NackHandler
-import org.jitsi.nlj.transform.node.incoming.IncomingStreamStatistics
+import org.jitsi.nlj.srtp.SrtpTransformers
+import org.jitsi.nlj.stats.EndpointConnectionStats
+import org.jitsi.nlj.stats.PacketStreamStats
+import org.jitsi.nlj.transform.NodeStatsProducer
+import org.jitsi.nlj.transform.node.incoming.IncomingStatisticsSnapshot
+import org.jitsi.nlj.util.Bandwidth
 
 abstract class RtpReceiver :
-    PacketHandler, EventHandler, Stoppable {
+    StatsKeepingPacketHandler(),
+    EventHandler,
+    NodeStatsProducer,
+    Stoppable,
+    EndpointConnectionStats.EndpointConnectionStatsListener {
     /**
-     * The handler which will be invoked for each RTP packet received
+     * The handler which will be invoked for each RTP/RTCP packet received
      * by this receiver (after it has gone through the receiver's
      * input chain).
      */
-    abstract var rtpPacketHandler: PacketHandler?
-    /**
-     * The handler which will be invoked for each RTCP packet received
-     * by this receiver (after it has gone through the receiver's
-     * input chain).  Most RTCP is terminated, however some messages
-     * (like PLI & FIR) will be forwarded through so they can be
-     * routed to their intended receipient.
-     */
-    abstract var rtcpPacketHandler: PacketHandler?
+    abstract var packetHandler: PacketHandler?
     /**
      * Enqueue an incoming packet to be processed
      */
     abstract fun enqueuePacket(p: PacketInfo)
 
     /**
-     * Set the SRTP transformer to be used for RTP decryption
+     * Set the SRTP transformers to be used for RTP/RTCP encryption and decryption
      */
-    abstract fun setSrtpTransformer(srtpTransformer: SinglePacketTransformer)
+    abstract fun setSrtpTransformers(srtpTransformers: SrtpTransformers)
+
+    abstract fun getStreamStats(): IncomingStatisticsSnapshot
+
+    abstract fun getPacketStreamStats(): PacketStreamStats.Snapshot
+
+    abstract fun tearDown()
+
+    abstract fun isReceivingAudio(): Boolean
+    abstract fun isReceivingVideo(): Boolean
 
     /**
-     * Set the SRTCP transformer to be used for RTCP decryption
+     * Forcibly mute or unmute the incoming audio stream
      */
-    abstract fun setSrtcpTransformer(srtcpTransformer: SinglePacketTransformer)
+    abstract fun forceMuteAudio(shouldMute: Boolean)
+}
 
-    abstract fun setAudioLevelListener(audioLevelListener: AudioLevelListener)
-
-    abstract fun getStreamStats(): Map<Long, IncomingStreamStatistics.Snapshot>
+interface RtpReceiverEventHandler {
+    /**
+     * We received an audio level indication from the remote endpoint.
+     */
+    fun audioLevelReceived(sourceSsrc: Long, level: Long) {}
+    /**
+     * The estimation of the available send bandwidth changed.
+     */
+    fun bandwidthEstimationChanged(newValue: Bandwidth) {}
 }

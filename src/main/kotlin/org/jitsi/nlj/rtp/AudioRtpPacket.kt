@@ -1,5 +1,5 @@
 /*
- * Copyright @ 2018 Atlassian Pty Ltd
+ * Copyright @ 2018 - Present, 8x8 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,18 @@
  */
 package org.jitsi.nlj.rtp
 
-import org.jitsi.rtp.RtpPacket
-import java.nio.ByteBuffer
+import org.jitsi.rtp.rtp.RtpPacket
 
-class AudioRtpPacket(buf: ByteBuffer) : RtpPacket(buf)
+open class AudioRtpPacket(
+    buffer: ByteArray,
+    offset: Int,
+    length: Int
+) : RtpPacket(buffer, offset, length) {
+
+    override fun clone(): AudioRtpPacket =
+        AudioRtpPacket(
+            cloneBuffer(BYTES_TO_LEAVE_AT_START_OF_PACKET),
+            BYTES_TO_LEAVE_AT_START_OF_PACKET,
+            length
+        )
+}
